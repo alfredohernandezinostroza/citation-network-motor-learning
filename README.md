@@ -48,6 +48,23 @@ You can:
 - **Click a topic** (Gemini dataset) for a detail panel including a **citation
   gaps** report: community pairs that share a topic but barely cite each other.
 
+## Word heatmaps
+
+Beyond the map itself, this repo carries tooling for asking **where a word sits
+on the map** — papers matching a word are smoothed into a 2D density (a
+fixed-bandwidth KDE) over the layout, so a word that belongs to one community
+shows up as a red blob there.
+
+```bash
+uv run word_heatmap.py bird                 # abstracts of the ForceAtlas layout
+uv run word_heatmap.py cerebellum --keywords
+python3 regen_heatmaps.py                   # the whole set, three field settings
+```
+
+`compare.html` is the interactive version: it computes the same maps in the
+browser and shows **abstract / keywords / both** side by side for any word you
+type. Serve the folder over HTTP and open `compare.html`.
+
 ## Files
 
 - `index.html` — page shell, controls panel, detail panel.
@@ -57,12 +74,24 @@ You can:
 - `data/` — the **SPECTER2** dataset bundle.
 - `gemini_data/` — the **Gemini** dataset bundle.
 - `forceatlas_data/` — the **ForceAtlas** (citation-graph) dataset bundle.
+- `word_heatmap.py` — word-occurrence KDE heatmaps as PNGs (see above).
+- `regen_heatmaps.py` — regenerates the whole `heatmaps/` set.
+- `compare.html` / `compare.js` — live abstract-vs-keywords comparison page.
+- `heatmaps/` — generated heatmaps, by field searched.
+- `*.graphml` — the citation graph with each layout's coordinates, for Gephi.
 
 Each bundle holds `nodes.json` (per-paper position/colour/metadata),
 `clusters.json` / `topics.json` and `communities.json` (group labels & colours),
 `abstracts.json` (lazily loaded), `edges_in.bin` / `edges_out.bin` (directed
 citation edges, CSR uint32), and — for the Gemini / ForceAtlas bundles —
 `snapshots.json` (per-cutoff-year layouts for the Time control).
+
+## Status
+
+This is a **temporary working repo**. The data bundles come from Eric
+Griessbach's CitationMap repository, and this implementation is expected to be
+absorbed into the main study repo later — so treat the layout of this
+repository as provisional.
 
 ## Credits
 

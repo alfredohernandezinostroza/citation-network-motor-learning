@@ -8,3 +8,8 @@ Thumbs.db
 
 # Not part of the published site (analysis/slide figures)
 presentation_assets/
+
+# Superseded renders and ad-hoc exports (regenerate with regen_heatmaps.py)
+heatmaps_old/
+heatmaps.zip
+wordmap_*.png
