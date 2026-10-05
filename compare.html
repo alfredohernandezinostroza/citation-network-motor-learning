@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Word maps — abstract vs keywords</title>
+<style>
+  :root {
+    --bg: #0e1116;
+    --panel-bg: rgba(20, 24, 32, 0.92);
+    --panel-border: #2a3140;
+    --text: #e6e9ef;
+    --text-dim: #9aa3b2;
+    --accent: #4ea1ff;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0; min-height: 100%;
+    background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+      "Helvetica Neue", Arial, sans-serif;
+    font-size: 13px;
+  }
+  header {
+    padding: 18px 20px 0;
+    max-width: 1680px; margin: 0 auto;
+  }
+  h1 { font-size: 17px; font-weight: 600; margin: 0 0 4px; }
+  .sub { color: var(--text-dim); margin-bottom: 14px; }
+  .sub a { color: var(--accent); }
+
+  /* ── Controls ───────────────────────────────────────────────────────── */
+  .controls {
+    display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-end;
+    background: var(--panel-bg); border: 1px solid var(--panel-border);
+    border-radius: 8px; padding: 12px 14px; margin-bottom: 6px;
+  }
+  .ctl { display: flex; flex-direction: column; gap: 4px; }
+  .ctl label { color: var(--text-dim); font-size: 11px; letter-spacing: .02em; }
+  .ctl.grow { flex: 1 1 320px; }
+  input[type="text"], select {
+    background: #161a22; color: var(--text);
+    border: 1px solid var(--panel-border); border-radius: 6px;
+    padding: 7px 9px; font: inherit; width: 100%;
+  }
+  input[type="text"]:focus, select:focus { outline: none; border-color: var(--accent); }
+  input[type="range"] { width: 130px; accent-color: var(--accent); }
+  .check { flex-direction: row; align-items: center; gap: 6px; padding-bottom: 8px; }
+  .check input { accent-color: var(--accent); }
+  .hint { color: var(--text-dim); font-size: 11px; padding: 2px 0 14px; }
+  .hint code { color: var(--text); background: #161a22; padding: 1px 4px; border-radius: 3px; }
+
+  /* ── Panels ─────────────────────────────────────────────────────────── */
+  main { padding: 0 20px 40px; max-width: 1680px; margin: 0 auto; }
+  .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
+  @media (max-width: 1100px) { .grid { grid-template-columns: 1fr; } }
+  .panel {
+    background: var(--panel-bg); border: 1px solid var(--panel-border);
+    border-radius: 8px; padding: 12px 14px 14px; min-width: 0;
+  }
+  .panel h2 { font-size: 13px; font-weight: 600; margin: 0 0 2px; }
+  .panel .count { color: var(--text-dim); margin-bottom: 8px; min-height: 16px; }
+  .panel canvas { width: 100%; display: block; border-radius: 4px; }
+  .comm { margin-top: 10px; border-top: 1px solid var(--panel-border); padding-top: 8px; }
+  .comm div { display: flex; justify-content: space-between; gap: 10px; padding: 2px 0; }
+  .comm .name { color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .comm .n { color: var(--text); font-variant-numeric: tabular-nums; }
+  .comm-head { color: var(--text-dim); font-size: 11px; letter-spacing: .03em;
+               text-transform: uppercase; padding-bottom: 2px; }
+  .panel .save {
+    margin-top: 10px; background: #161a22; color: var(--text-dim);
+    border: 1px solid var(--panel-border); border-radius: 6px;
+    padding: 5px 9px; font: inherit; cursor: pointer;
+  }
+  .panel .save:hover { color: var(--accent); border-color: var(--accent); }
+
+  #status {
+    padding: 8px 0 14px; color: var(--text-dim);
+  }
+  #status.err { color: #ff8a8a; }
+  .forms { color: var(--text-dim); font-size: 11px; padding-bottom: 10px; }
+  .forms code { color: var(--text); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Word maps — abstract vs keywords</h1>
+  <div class="sub">
+    Where a word sits on the motor-learning map, computed live. Same KDE as
+    <code>word_heatmap.py</code>; each panel is normalised to its own peak.
+  </div>
+
+  <div class="controls">
+    <div class="ctl grow">
+      <label for="words">Words — several are OR'd together; "quote a phrase"</label>
+      <input id="words" type="text" value="bird" spellcheck="false"
+             placeholder='bird   or   "motor imagery"   or   zebra birdsong' />
+    </div>
+    <div class="ctl">
+      <label for="dataset">Layout</label>
+      <select id="dataset"></select>
+    </div>
+    <div class="ctl">
+      <label for="match">Match</label>
+      <select id="match">
+        <option value="word">whole word + plurals</option>
+        <option value="prefix">prefix (bird → birdsong)</option>
+        <option value="substring">substring (rat → rationale)</option>
+      </select>
+    </div>
+    <div class="ctl">
+      <label for="weight">Weight</label>
+      <select id="weight">
+        <option value="presence">presence</option>
+        <option value="count">count</option>
+        <option value="log">log(1+count)</option>
+        <option value="rate">per 1000 words</option>
+      </select>
+    </div>
+    <div class="ctl">
+      <label for="mode">Colour</label>
+      <select id="mode">
+        <option value="density">density</option>
+        <option value="enrichment">enrichment</option>
+      </select>
+    </div>
+    <div class="ctl">
+      <label for="bw">Bandwidth <span id="bw-val">2.0%</span></label>
+      <input id="bw" type="range" min="5" max="60" value="20" />
+    </div>
+    <div class="ctl check">
+      <input id="dots" type="checkbox" checked />
+      <label for="dots">paper dots</label>
+    </div>
+    <div class="ctl check">
+      <input id="rings" type="checkbox" />
+      <label for="rings">match rings</label>
+    </div>
+  </div>
+  <div class="hint">
+    Matching mirrors the script: <code>rat</code> finds rat/rats but not rate or
+    rationale. Irregular plurals aren't handled — search
+    <code>mouse mice</code> or <code>prosthesis prostheses</code> together.
+  </div>
+  <div class="forms" id="forms"></div>
+  <div id="status">Loading…</div>
+</header>
+
+<main>
+  <div class="grid" id="grid"></div>
+</main>
+
+<script src="compare.js"></script>
+</body>
+</html>
