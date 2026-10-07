@@ -16,6 +16,7 @@
 
 import Graph from "https://cdn.jsdelivr.net/npm/graphology@0.25.4/+esm";
 import { Sigma } from "https://cdn.jsdelivr.net/npm/sigma@2.4.0/+esm";
+import { MATCH_MODES, makeFilter } from "./textmatch.js";
 
 // ── Dataset definitions ─────────────────────────────────────────────────────
 // Each grouping: key (also the "Color by" value), label (detail panel + color
@@ -169,6 +170,7 @@ const state = {
   wellConnected: null,
   wellConnectedMasks: {},
   wellConnectedOnly: true, // the "Papers" control
+  matchMode: "word", // search + filters: word | prefix | substring | regex (textmatch.js)
 
   // floating-label bookkeeping for the currently-active grouping
   labelMode: "dynamic", // dynamic | always
@@ -222,6 +224,9 @@ main().catch((err) => {
   const el = document.getElementById("loading");
   if (el) el.textContent = "Failed to load: " + err.message;
 });
+
+// For the Word map tab (wordmap.js): which resolution the map is coloured by.
+window.scientographer = { communityResolution: () => state.communityResolution };
 
 async function main() {
   // One-time wiring (event listeners on static DOM); the renderer + per-frame
@@ -568,6 +573,46 @@ function applyOrientation() {
 // node, framed to fit.
 const EXPORT_FONT = '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
 const EXPORT_EDGE_ALPHA = 0.16;
+// On white paper the map's light community colours wash out, so the light style
+// darkens them (HSL lightness capped, saturation floored) and strengthens edges.
+const EXPORT_LIGHT = { edgeAlpha: 0.22, maxLightness: 0.45, textMaxLightness: 0.36, minSaturation: 0.45 };
+
+function parseColor(color) {
+  const hex = /^#([0-9a-f]{3}|[0-9a-f]{6})$/i.exec(color || "");
+  if (hex) {
+    const h = hex[1].length === 3 ? hex[1].split("").map((c) => c + c).join("") : hex[1];
+    return [0, 2, 4].map((i) => parseInt(h.slice(i, i + 2), 16));
+  }
+  const rgb = /rgba?\(([^)]+)\)/i.exec(color || "");
+  return rgb ? rgb[1].split(",").slice(0, 3).map((v) => parseFloat(v)) : [136, 136, 136];
+}
+
+// The colour, darkened until it reads on white (greys stay grey).
+function colorForWhite(color, maxLightness) {
+  const [r, g, b] = parseColor(color).map((v) => v / 255);
+  const max = Math.max(r, g, b), min = Math.min(r, g, b);
+  let h = 0, sat = 0;
+  const light = (max + min) / 2;
+  if (max !== min) {
+    const d = max - min;
+    sat = light > 0.5 ? d / (2 - max - min) : d / (max + min);
+    h = max === r ? (g - b) / d + (g < b ? 6 : 0) : max === g ? (b - r) / d + 2 : (r - g) / d + 4;
+    h /= 6;
+  }
+  const grey = sat < 0.12;
+  const l = Math.min(light, grey ? maxLightness + 0.15 : maxLightness);
+  const s = grey ? sat : Math.max(sat, EXPORT_LIGHT.minSaturation);
+  const q = l < 0.5 ? l * (1 + s) : l + s - l * s, p2 = 2 * l - q;
+  const channel = (t) => {
+    t = (t + 1) % 1;
+    if (t < 1 / 6) return p2 + (q - p2) * 6 * t;
+    if (t < 1 / 2) return q;
+    if (t < 2 / 3) return p2 + (q - p2) * (2 / 3 - t) * 6;
+    return p2;
+  };
+  const out = s === 0 ? [l, l, l] : [channel(h + 1 / 3), channel(h), channel(h - 1 / 3)];
+  return `rgb(${out.map((v) => Math.round(v * 255)).join(",")})`;
+}
 const EXPORT_CURVATURE = 0.25; // control-point offset as a fraction of edge length
 
 function initExportControls() {
@@ -585,6 +630,7 @@ function initExportControls() {
         longSide: parseInt(document.getElementById("export-size").value, 10),
         edges: document.getElementById("export-edges").value,
         nodeScale: parseFloat(document.getElementById("export-nodes").value),
+        background: document.getElementById("export-background")?.value || "transparent-light",
         labels: document.getElementById("export-labels").checked,
       });
     } catch (err) {
@@ -617,7 +663,7 @@ function visibleNodeDrawData() {
   return out;
 }
 
-async function exportMapPng({ area, longSide, edges, nodeScale, labels }) {
+async function exportMapPng({ area, longSide, edges, nodeScale, labels, background }) {
   const nodes = visibleNodeDrawData();
   const { width: viewWidth, height: viewHeight } = state.renderer.getDimensions();
 
@@ -648,8 +694,17 @@ async function exportMapPng({ area, longSide, edges, nodeScale, labels }) {
   if (!ctx) throw new Error(`the browser could not allocate a ${canvas.width}×${canvas.height} canvas`);
   const px = (n) => [(n.x - x0) * scale, (n.y - y0) * scale];
 
-  ctx.fillStyle = getComputedStyle(document.body).backgroundColor || "#0e1116";
-  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  // Background: transparent or filled, styled for a white page (darker colours,
+  // white label outlines) or for a dark one (the map's own colours).
+  const forWhite = background === "white" || background === "transparent-light";
+  if (background === "dark") {
+    ctx.fillStyle = getComputedStyle(document.body).backgroundColor || "#0e1116";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+  } else if (background === "white") {
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+  }
+  const paint = forWhite ? (c) => colorForWhite(c, EXPORT_LIGHT.maxLightness) : (c) => c;
 
   // Edges: citations between two visible papers with at least one end in the
   // region, coloured by the citing paper, one path per colour.
@@ -665,10 +720,10 @@ async function exportMapPng({ area, longSide, edges, nodeScale, labels }) {
         byColor.get(source.color).push(i, t);
       }
     }
-    ctx.globalAlpha = EXPORT_EDGE_ALPHA;
+    ctx.globalAlpha = forWhite ? EXPORT_LIGHT.edgeAlpha : EXPORT_EDGE_ALPHA;
     ctx.lineWidth = Math.max(0.5, 0.35 * sizeScale);
     for (const [color, pairs] of byColor) {
-      ctx.strokeStyle = color;
+      ctx.strokeStyle = paint(color);
       ctx.beginPath();
       for (let k = 0; k < pairs.length; k += 2) {
         const [sx, sy] = px(nodes[pairs[k]]);
@@ -695,7 +750,7 @@ async function exportMapPng({ area, longSide, edges, nodeScale, labels }) {
     for (const i of order) {
       const n = nodes[i];
       const [x, y] = px(n);
-      ctx.fillStyle = n.color;
+      ctx.fillStyle = paint(n.color);
       ctx.beginPath();
       ctx.arc(x, y, Math.max(0.6, n.r * sizeScale * nodeScale), 0, 2 * Math.PI);
       ctx.fill();
@@ -735,10 +790,12 @@ async function exportMapPng({ area, longSide, edges, nodeScale, labels }) {
       const box = { l: cx - w / 2 - gap, r: cx + w / 2 + gap, t: cy - fontSize / 2 - gap, b: cy + fontSize / 2 + gap };
       if (placed.some((o) => box.l < o.r && box.r > o.l && box.t < o.b && box.b > o.t)) continue;
       placed.push(box);
-      ctx.lineWidth = 3 * sizeScale; // dark halo keeps text readable over edges
-      ctx.strokeStyle = "rgba(0,0,0,0.75)";
+      // An outline in the background's colour keeps text readable over edges.
+      ctx.lineWidth = (forWhite ? 4 : 3) * sizeScale;
+      ctx.strokeStyle = forWhite ? "rgba(255,255,255,0.9)" : "rgba(0,0,0,0.75)";
       ctx.strokeText(text, cx, cy);
-      ctx.fillStyle = g.data[gid].color || "#e6e9ef";
+      const labelColor = g.data[gid].color || "#e6e9ef";
+      ctx.fillStyle = forWhite ? colorForWhite(labelColor, EXPORT_LIGHT.textMaxLightness) : labelColor;
       ctx.fillText(text, cx, cy);
     }
   }
@@ -2120,17 +2177,26 @@ function initSearch() {
   });
 
   function runSearch(q) {
-    q = q.trim().toLowerCase();
+    q = q.trim();
     if (q.length < 3) {
       list.hidden = true;
       list.innerHTML = "";
       return;
     }
+    // Titles and authors in the chosen matching mode; DOIs anywhere.
+    let test;
+    try {
+      test = makeFilter(q, state.matchMode);
+    } catch {
+      list.hidden = true;
+      return;
+    }
+    const doi = q.toLowerCase();
     const hits = [];
     const nodes = state.nodesData.nodes;
     const idx = state.index;
     for (let i = 0; i < nodes.length && hits.length < 25; i++) {
-      if (idx.title[i].includes(q) || idx.authors[i].includes(q) || idx.doi[i].includes(q)) hits.push(i);
+      if (test(idx.title[i]) || test(idx.authors[i]) || idx.doi[i].includes(doi)) hits.push(i);
     }
     list.innerHTML = hits
       .map((i) => {
@@ -2289,6 +2355,7 @@ function initTabs() {
     { tabId: "tab-graph", viewId: "view-graph" },
     { tabId: "tab-metrics", viewId: "view-metrics" },
     { tabId: "tab-figures", viewId: "view-figures" },
+    { tabId: "tab-wordmap", viewId: "view-wordmap" },
   ];
   for (const { tabId, viewId } of TABS) {
     const tabEl = document.getElementById(tabId);
@@ -2347,6 +2414,16 @@ function initGlobalFilters() {
 
   btn.addEventListener("click", run);
 
+  const mode = document.getElementById("match-mode");
+  if (mode) {
+    mode.innerHTML = MATCH_MODES.map((m) => `<option value="${m.value}">${escapeHtml(m.label)}</option>`).join("");
+    mode.value = state.matchMode;
+    mode.addEventListener("change", () => {
+      state.matchMode = mode.value;
+      if (state.filteredSet) run();
+    });
+  }
+
   const inputs = [elTitle, elAuthor, elAbstract, elJournal, elKeywords].filter(Boolean);
   for (const input of inputs) {
     input.addEventListener("keydown", (e) => {
@@ -2357,16 +2434,6 @@ function initGlobalFilters() {
   }
 }
 
-function splitCommaQueries(s) {
-  return s
-    .split(",")
-    .map((x) => x.trim().toLowerCase())
-    .filter(Boolean);
-}
-function matchesAll(pipeLc, queries) {
-  for (const q of queries) if (!pipeLc.includes(q)) return false;
-  return true;
-}
 
 async function ensureAbstractsLoadedIfNeeded() {
   if (state.filters.abstract.trim() && !state.abstracts) await loadAbstract("n2");
@@ -2376,12 +2443,17 @@ async function applyGlobalFilters() {
   await ensureAbstractsLoadedIfNeeded();
 
   const f = state.filters;
-  const qTitle = f.title.trim().toLowerCase();
-  const qJournal = f.journal.trim().toLowerCase();
-  const qAbstract = f.abstract.trim().toLowerCase();
-  const authorQs = splitCommaQueries(f.author);
-  const keywordQs = splitCommaQueries(f.keywords);
-  const meshQs = splitCommaQueries(f.mesh);
+  // Every field: comma-separated queries that must all match, in the chosen
+  // matching mode (whole words by default, so "dance" skips "guidance").
+  let tests;
+  try {
+    tests = Object.fromEntries(["title", "journal", "abstract", "author", "keywords", "mesh"]
+      .map((k) => [k, makeFilter(f[k] || "", state.matchMode)]));
+  } catch (err) {
+    const el = document.getElementById("selected-count");
+    if (el) el.textContent = `Invalid regular expression: ${err.message}`;
+    return;
+  }
 
   const lo = state.yearMin;
   const hi = state.yearMax;
@@ -2394,15 +2466,12 @@ async function applyGlobalFilters() {
     if (state.snapshot && !state.snapshot.visible.has(String(i))) continue;
     if (r.year != null && (r.year < lo || r.year > hi)) continue;
     if (nodeHiddenByMute(r) || removedByModifier(i)) continue;
-    if (qTitle && !idx.title[i].includes(qTitle)) continue;
-    if (qJournal && !idx.journal[i].includes(qJournal)) continue;
-    if (authorQs.length && !matchesAll(idx.authors[i], authorQs)) continue;
-    if (keywordQs.length && !matchesAll(idx.keywords[i], keywordQs)) continue;
-    if (meshQs.length && !matchesAll(idx.mesh[i], meshQs)) continue;
-    if (qAbstract) {
-      const abs = (state.abstracts?.[r.id] || "").toLowerCase();
-      if (!abs.includes(qAbstract)) continue;
-    }
+    if (tests.title && !tests.title(idx.title[i])) continue;
+    if (tests.journal && !tests.journal(idx.journal[i])) continue;
+    if (tests.author && !tests.author(idx.authors[i])) continue;
+    if (tests.keywords && !tests.keywords(idx.keywords[i])) continue;
+    if (tests.mesh && !tests.mesh(idx.mesh[i])) continue;
+    if (tests.abstract && !tests.abstract(state.abstracts?.[r.id] || "")) continue;
     out.add(String(i));
   }
 

@@ -3,9 +3,9 @@
 An interactive, browsable map of the **motor-learning research literature**
 (22,982 papers, 183,808 citations among them). Each dot is a paper. Switch
 between the **citation-network layout** and two **text-embedding layouts**
-(Gemini, SPECTER2), colour the papers by citation community at any of 45
-resolutions, by semantic topic, year or citation count, and export what you see
-as a high-resolution image.
+(Gemini, SPECTER2), colour the papers by citation community at any of 46
+resolutions, by semantic topic, year or citation count, map where any word
+appears, and export what you see as a high-resolution image.
 
 This repository is the **static site only**: a dependency-free front end
 (sigma.js + graphology, loaded from CDN) plus the data bundles it reads. It is
@@ -41,12 +41,12 @@ In every view:
 - **Colour by** citation **community** (Leiden/CPM on the directed citation
   graph), the layout's own **clusters / topics** (embedding views), **year**,
   **citations** or **integration**.
-- **Community resolution**: 45 resolutions from 0.0001 (a few large
+- **Community resolution**: 46 resolutions from 0.0001 (a few large
   communities) to 0.9. The choice carries across views. Communities are named
   by their most distinguishing author keywords (corrected TF-IDF).
   Note: CPM here runs on the *directed* graph, so a resolution γ here equals
   2γ in Gephi's (undirected) Leiden plugin; the earlier version of this map
-  used Gephi γ = 0.003, i.e. 0.0015 here.
+  used Gephi γ = 0.003, i.e. 0.0015 here, which is in the list.
 - **Well-connected papers only** (on by default): at each resolution, show only
   the papers in a community that the Connectivity Modifier (Park et al.) keeps
   as well connected: at least 11 papers, and no cut of log10(size) citations or
@@ -57,18 +57,29 @@ In every view:
   well-connectedness, the Connectivity Modifier) changes across resolutions,
   community health, and each community's distinguishing keywords.
 - **Figures** tab: word clouds and keyword histograms.
-- **Orientation**: rotate or mirror the map.
+- **Word map** tab: where words sit on every view, computed live. Papers whose
+  abstract, keywords or both match are smoothed into a density over each
+  layout (or an enrichment over all papers), with weighting, bandwidth, paper
+  dots, match rings and a PNG per panel; each panel names the community holding
+  most matches.
+- **Orientation**: the map opens with the main body's long axis horizontal, its
+  long tail down and its most-cited side on the left; rotate or mirror it.
 - **Export image**: the current view or the whole map as a PNG of up to
-  12,000 px, with straight or curved (Gephi-style) citation edges. Only the
-  visible papers and communities are drawn.
+  12,000 px, with straight or curved (Gephi-style) citation edges, transparent
+  (styled for white pages or for dark slides) or on a white or dark background.
+  Only the visible papers and communities are drawn.
 - **Search**, **filter** (publication, author, abstract, journal, keywords,
   year), **hover** for details, **click** a paper to trace its citations, click a
   community or topic label for its detail panel; hiding a community in the
-  legend also hides its label.
+  legend also hides its label. Search and filters match **whole words** (with
+  plurals) by default, so "dance" doesn't find "guidance"; the **Text matching**
+  menu switches to word beginnings, anywhere, or regular expressions.
+  Comma-separated filter queries must all match.
 
 ## Files
 
-- `index.html`, `main.js`, `styles.css`, `tour.js`: the front end.
+- `index.html`, `main.js`, `styles.css`, `tour.js`: the front end;
+  `textmatch.js`: search and filter matching; `wordmap.js`: the Word map tab.
 - `views.json`: the list of views.
 - `network_data/`: the citation-network view, plus files every view shares
   (metrics, keywords, figure index, abstracts).
