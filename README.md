@@ -42,7 +42,7 @@ In every view:
   graph), the layout's own **clusters / topics** (embedding views), **year**,
   **citations** or **integration**.
 - **Community resolution**: 46 resolutions from 0.0001 (a few large
-  communities) to 0.9. The choice carries across views. Communities are named
+  communities) to 0.9; the map opens at 0.0015. The choice carries across views. Communities are named
   by their most distinguishing author keywords (corrected TF-IDF).
   Note: CPM here runs on the *directed* graph, so a resolution γ here equals
   2γ in Gephi's (undirected) Leiden plugin; the earlier version of this map
@@ -61,7 +61,8 @@ In every view:
   abstract, keywords or both match are smoothed into a density over each
   layout (or an enrichment over all papers), with weighting, bandwidth, paper
   dots, match rings and a PNG per panel; each panel names the community holding
-  most matches.
+  most matches. It follows the map's resolution and well-connected filter (and
+  has its own controls for both, kept in sync with the Graph tab).
 - **Orientation**: the map opens with the main body's long axis horizontal, its
   long tail down and its most-cited side on the left; rotate or mirror it.
 - **Export image**: the current view or the whole map as a PNG of up to
