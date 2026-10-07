@@ -1,10 +1,12 @@
 <!doctype html>
+<!-- SPDX-FileCopyrightText: 2026 Alfredo Hernández Inostroza and the Scientographer contributors
+     SPDX-License-Identifier: MIT -->
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Motor Learning Semantic Map</title>
-  <link rel="stylesheet" href="styles.css">
+  <link rel="stylesheet" href="styles.css?v=5">
 
   <!-- Tabulator -->
   <link href="https://unpkg.com/tabulator-tables@6.3.1/dist/css/tabulator.min.css" rel="stylesheet">
@@ -60,6 +62,107 @@
     </div>
   </div> -->
 
+  <!-- Resolution-metrics tab pane: whole-graph clustering-quality metrics vs.
+       Leiden/CPM resolution (community_quality_metrics.py), rendered as a grid
+       of small-multiple charts. Hidden entirely if a dataset has no
+       resolution_metrics.json (see initMetricsTab). -->
+  <div id="view-metrics" class="view">
+    <div id="metrics-wrap" class="panel">
+      <div class="metrics-head">
+        <h2>Community-quality metrics by resolution</h2>
+        <p class="meta">How the Leiden/CPM partition's quality changes across the swept
+           resolutions &mdash; use this to judge which resolution(s) give the most robust,
+           meaningful community structure. Click any point to color the map by that
+           resolution's communities.</p>
+      </div>
+      <div id="metrics-grid"></div>
+
+      <!-- Well-connectedness diagnostic (community_connectivity_metrics.py) and
+           the Connectivity Modifier before/after (community_connectivity_modifier.py),
+           via connectivity_metrics.json. Hidden if that file is absent. -->
+      <section id="view-connectivity-section" hidden>
+        <div class="metrics-head">
+          <h2>Well-connectedness &amp; the Connectivity Modifier</h2>
+          <p class="meta">A community is <strong>well-connected</strong> only if its minimum edge cut
+             exceeds log<sub>10</sub>(n) &mdash; deleting a handful of edges shouldn&rsquo;t split it. The
+             <strong>Connectivity Modifier</strong> enforces that by trimming or splitting communities
+             that fail. These panels show the diagnostic and what remediation costs; the before/after
+             lines on the charts above are that same remediation scored on every quality metric.</p>
+        </div>
+        <div id="connectivity-grid" class="metrics-grid-like"></div>
+      </section>
+
+      <!-- Per-community health: are the detected communities real, or artifacts?
+           Driven by community_distributions.json (every community, including the
+           singletons that never reach the map legend). Hidden if absent. -->
+      <section id="view-health-section" hidden>
+        <div class="metrics-head">
+          <h2>Are these real communities, or artifacts?</h2>
+          <p class="meta">Most of what Leiden reports as a &ldquo;community&rdquo; at any resolution
+             is a single paper or a 2&ndash;3 paper fragment, and no descriptive metric flags them
+             &mdash; a 2-paper mutually-citing pair has internal edge density 1.0, which looks
+             perfect. <strong>Internal edge surprise</strong> is size-aware, so it separates
+             genuinely cohesive communities from trivially dense ones.</p>
+        </div>
+
+        <div id="health-summary"></div>
+
+        <h3 class="health-subhead">Across resolutions</h3>
+        <div id="health-across-grid" class="metrics-grid-like"></div>
+
+        <h3 class="health-subhead">At the selected resolution</h3>
+        <div class="health-controls">
+          <label>Histogram of
+            <select id="health-histogram-metric"></select>
+          </label>
+          <label>Scatter y-axis
+            <select id="health-scatter-metric"></select>
+          </label>
+          <label class="health-check">
+            <input id="health-exclude-singletons" type="checkbox"> Exclude singletons
+          </label>
+        </div>
+        <div id="health-selected-grid" class="metrics-grid-like"></div>
+
+        <div id="health-table"></div>
+      </section>
+
+      <!-- Per-community distinguishing keywords at the selected resolution
+           (community_keywords.json: community_keywords.py's corrected TF-IDF, or the
+           site's own TF-IDF fallback). Hidden if that file is absent. -->
+      <section id="view-keywords-section" hidden>
+        <div class="metrics-head">
+          <h2>What each community is about</h2>
+          <p class="meta" id="keywords-meta">Each community's keyword list is one document; the bars are
+             the keywords that most distinguish that community from the others at the selected
+             resolution. Click a community's name to open it on the map.</p>
+        </div>
+        <div id="keywords-grid" class="metrics-grid-like"></div>
+      </section>
+    </div>
+  </div>
+
+  <!-- Figures tab pane: pipeline figures (word clouds, ...) copied by build_website.py
+       and indexed in figures.json. Hidden entirely if that file is absent. -->
+  <div id="view-figures" class="view">
+    <div id="figures-wrap" class="panel">
+      <div class="metrics-head">
+        <h2>Figures from the pipeline</h2>
+        <p class="meta">Word clouds and other figures produced by the analysis DAGs. Figures are
+           tagged with the graph and community resolution they were computed on; those made on a
+           different graph than this map are marked, since their community ids do not line up
+           with the map's.</p>
+      </div>
+      <div class="health-controls">
+        <label class="health-check">
+          <input id="figures-follow-resolution" type="checkbox" checked> Only figures for the selected community resolution
+        </label>
+        <span class="meta" id="figures-count"></span>
+      </div>
+      <div id="figures-grid"></div>
+    </div>
+  </div>
+
   <!-- Controls panel -->
   <div id="controls" class="panel collapsed">
     <button id="controls-toggle" class="icon-btn" type="button" aria-label="Show controls">⟩</button>
@@ -67,11 +170,13 @@
     <div class="topline">
       <div class="titleblock">
         <h1>Motor Learning Semantic Map</h1>
-        <p class="subtitle" id="subtitle">14,511 papers &middot; ForceAtlas layout of the citation graph</p>
+        <p class="subtitle" id="subtitle"></p>
       </div>
 
       <div class="tabs">
         <button id="tab-graph" class="tab active" type="button">Graph</button>
+        <button id="tab-metrics" class="tab" type="button" hidden>Metrics</button>
+        <button id="tab-figures" class="tab" type="button" hidden>Figures</button>
         <!-- <button id="tab-table" class="tab" type="button">Table</button> -->
       </div>
     </div>
@@ -97,12 +202,10 @@
       <input id="year-max" type="range">
     </div>
 
-    <div class="control-row">
-      <label>Dataset</label>
+    <div class="control-row" hidden>
+      <label>View</label>
       <select id="dataset-select">
-        <option value="forceatlas">ForceAtlas - Citations</option>
-        <option value="gemini">Gemini - Topics</option>
-        <option value="specter">Specter - Topics</option>
+        <option value="network">Citation network</option>
       </select>
     </div>
 
@@ -114,6 +217,58 @@
     <div class="control-row">
       <label>Color by</label>
       <select id="color-by"></select>
+    </div>
+
+    <div class="control-row" id="community-resolution-row" hidden>
+      <label>Community resolution</label>
+      <select id="community-resolution"></select>
+    </div>
+
+    <div class="control-row checkbox-row" id="well-connected-row" hidden>
+      <label title="At each resolution the Connectivity Modifier keeps the papers that sit in a well-connected community (minimum cut above log10 of its size) of at least 11 papers. Uncheck to show every paper.">
+        <input id="well-connected-only" type="checkbox" checked> Well-connected papers only
+      </label>
+      <span class="meta well-connected-note" id="well-connected-note"></span>
+    </div>
+
+    <div class="control-row">
+      <label>Orientation</label>
+      <div class="orientation-buttons">
+        <button id="rotate-left" type="button" title="Rotate the map 15° counter-clockwise" aria-label="Rotate left">&#x27F2;</button>
+        <button id="rotate-right" type="button" title="Rotate the map 15° clockwise" aria-label="Rotate right">&#x27F3;</button>
+        <button id="flip-horizontal" type="button" title="Mirror the map left–right" aria-label="Flip horizontally">&#x21C6;</button>
+        <button id="flip-vertical" type="button" title="Mirror the map top–bottom" aria-label="Flip vertically">&#x21C5;</button>
+        <button id="orientation-reset" type="button" title="Back to the original orientation" aria-label="Reset orientation">Reset</button>
+      </div>
+    </div>
+
+    <div class="control-row export-row">
+      <label>Export image</label>
+      <div class="export-options">
+        <select id="export-area" aria-label="Area to export">
+          <option value="view">View</option>
+          <option value="all">Whole map</option>
+        </select>
+        <select id="export-size" aria-label="Image size (long side)">
+          <option value="4000">4,000 px</option>
+          <option value="8000" selected>8,000 px</option>
+          <option value="12000">12,000 px</option>
+        </select>
+        <select id="export-edges" aria-label="Citation edges">
+          <option value="none">No edges</option>
+          <option value="straight">Straight edges</option>
+          <option value="curved">Curved edges</option>
+        </select>
+      </div>
+      <div class="export-actions">
+        <select id="export-nodes" aria-label="Node size">
+          <option value="1">Nodes</option>
+          <option value="0.35">Small nodes</option>
+          <option value="0">No nodes</option>
+        </select>
+        <label class="export-check"><input id="export-labels" type="checkbox" checked> Labels</label>
+        <button id="export-png" type="button">Export PNG</button>
+      </div>
     </div>
 
     <div class="control-row">
@@ -141,30 +296,13 @@
 
     <details class="about">
       <summary>About this map</summary>
-      <p>Each dot is a paper; dot size is total citation degree. Three
-         <strong>layouts</strong> place the same ~14,500 papers differently:</p>
-      <ul>
-        <li><strong>Specter &ndash; Topics</strong>: 2D UMAP of SPECTER2 text
-            embeddings, so papers with similar text sit near each other.</li>
-        <li><strong>Gemini &ndash; Topics</strong>: 2D UMAP of Gemini text
-            embeddings (the current pipeline).</li>
-        <li><strong>ForceAtlas &ndash; Citations</strong>: a force-directed
-            layout of the <strong>citation graph</strong> itself, so papers that
-            cite each other are pulled together &mdash; position reflects
-            citation structure, not text.</li>
-      </ul>
-      <p>Use <strong>Color by</strong> to recolor: semantic topic/cluster, Leiden
-         citation <strong>community</strong>, year, or citation count. (The
-         embedding views default to topics; the ForceAtlas view to communities.)</p>
-      <p>On the <strong>Gemini</strong> and <strong>ForceAtlas</strong> maps, the
-         <strong>Time</strong> control re-lays-out the field as it stood up to a
-         given year (&le; 1980 / 1990 / 2000 / 2010, or &ldquo;All&rdquo; for now).
-         Each snapshot re-runs the layout (UMAP of the embeddings, or a
-         force-directed layout of the citation graph) using <em>only</em> the
-         papers and citations that
-         existed by then, so you can watch the structure grow. Colours and
-         topic/community membership stay the present-day clustering &mdash; only
-         the positions change.</p>
+      <p>Each dot is a paper; dot size is total citation degree. Positions come
+         from the citation graph's layout (papers that cite each other are pulled
+         together), so position reflects <strong>citation structure</strong>.</p>
+      <p>Use <strong>Color by</strong> to recolor: the semantic
+         <strong>topic</strong> (from the text-embedding clustering written onto
+         the graph), the Leiden citation <strong>community</strong>, year, or
+         citation count.</p>
       <p><strong>Hover</strong> any paper for its title, year and authors.
          <strong>Click</strong> a paper to draw its citation links and open the
          side panel. Toggle <strong>citation edges</strong> to see where the
@@ -182,6 +320,13 @@
          you can see e.g. which community each island belongs to. Several islands
          in one topic means papers that share a subject but form separate,
          non-citing literatures.</p>
+      <p>The Leiden/CPM citation communities were swept across several
+         resolutions; use <strong>Community resolution</strong> to switch which
+         one colours the map (a higher resolution splits papers into more,
+         smaller communities). The <strong>Metrics</strong> tab shows how
+         clustering quality (modularity, stability across reseeding, etc.)
+         changes across that sweep, to help judge which resolution is most
+         meaningful.</p>
     </details>
   </div>
 
@@ -192,7 +337,7 @@
   </aside>
 
   <!-- Loading overlay -->
-  <div id="loading">Loading semantic map...</div>
+  <div id="loading">Loading map...</div>
 
   <!-- Guided tour launcher -->
   <button id="start-tour" type="button"><span class="tour-icon">?</span> Guided tour</button>
@@ -201,8 +346,8 @@
   <script src="https://unpkg.com/tabulator-tables@6.3.1/dist/js/tabulator.min.js"></script>
 
   <!-- App -->
-  <script type="module" src="main.js?v=18"></script>
+  <script type="module" src="main.js?v=26"></script>
   <!-- Guided tour (independent of main.js; only reads the DOM) -->
-  <script type="module" src="tour.js?v=1"></script>
+  <script type="module" src="tour.js?v=2"></script>
 </body>
 </html>

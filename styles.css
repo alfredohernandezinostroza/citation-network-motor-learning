@@ -1,3 +1,5 @@
+/* SPDX-FileCopyrightText: 2026 Alfredo Hernández Inostroza and the Scientographer contributors
+ * SPDX-License-Identifier: MIT */
 
 
 :root {
@@ -8,6 +10,9 @@
   --text-dim: #9aa3b2;
   --accent: #4ea1ff;
   --accent-dim: rgba(78, 161, 255, 0.4);
+  /* "After CM" second series: a rose distinct from the blue accent and the amber
+     threshold, legible on the dark panels. Identity is dash + hue, not colour alone. */
+  --accent-after: #e06c9f;
 }
 
 * { box-sizing: border-box; }
@@ -598,6 +603,290 @@ details.about p {
   font-size: 11px;
 }
 
+/* ── Metrics tab (community-quality metrics vs. resolution) ──────────────── */
+#metrics-wrap {
+  top: 16px;
+  left: 16px;
+  right: 16px;
+  bottom: 16px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+}
+.metrics-head { margin-bottom: 6px; }
+.metrics-head h2 { margin: 0 0 4px; font-size: 15px; font-weight: 600; }
+.metrics-head p.meta {
+  color: var(--text-dim);
+  font-size: 12px;
+  line-height: 1.5;
+  margin: 0 0 12px;
+  max-width: 640px;
+}
+
+#metrics-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 14px;
+}
+
+.metric-tile {
+  background: #161a22;
+  border: 1px solid var(--panel-border);
+  border-radius: 8px;
+  padding: 10px 12px 6px;
+}
+.metric-tile-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+}
+.metric-tile-hint {
+  font-size: 10.5px;
+  color: var(--text-dim);
+  line-height: 1.4;
+  margin: 2px 0 6px;
+}
+.metric-chart {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+.metric-axis { stroke: var(--panel-border); stroke-width: 1; }
+.metric-gridline { stroke: var(--panel-border); stroke-width: 1; opacity: 0.4; }
+.metric-threshold { stroke: #ffb14e; stroke-width: 1; stroke-dasharray: 3 3; opacity: 0.8; }
+.metric-band { fill: #ffb14e; opacity: 0.10; }
+.metric-line { fill: none; stroke: var(--accent); stroke-width: 2; stroke-linejoin: round; }
+.metric-dot { fill: var(--accent); }
+.metric-line-after { stroke: var(--accent-after); stroke-dasharray: 4 3; }
+.metric-dot-after { fill: var(--accent-after); }
+.metric-tick { fill: var(--text-dim); font-size: 8px; }
+.metric-axis-title { fill: var(--text-dim); font-size: 8.5px; font-weight: 600; }
+.metric-crosshair { stroke: var(--text-dim); stroke-width: 1; stroke-dasharray: 2 2; }
+.metric-capture { fill: transparent; }
+.metric-ribbon { fill: var(--accent); opacity: 0.16; }
+.metric-tile-note {
+  font-size: 9.5px;
+  color: var(--text-dim);
+  padding: 2px 0 4px;
+}
+
+/* ── Per-community health section ──────────────────────────────────────── */
+#view-health-section {
+  margin-top: 26px;
+  padding-top: 18px;
+  border-top: 1px solid var(--panel-border);
+}
+.health-subhead {
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-dim);
+  margin: 18px 0 10px;
+}
+.metrics-grid-like {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 14px;
+}
+/* Composition + scatter carry a legend, so they get more room. */
+.metric-tile-wide { grid-column: span 2; }
+@media (max-width: 760px) { .metric-tile-wide { grid-column: span 1; } }
+
+/* Headline numbers: the summary the charts below unpack. */
+#health-summary {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 12px;
+  margin-bottom: 6px;
+}
+.health-tile {
+  background: #161a22;
+  border: 1px solid var(--panel-border);
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+.ht-value { font-size: 22px; font-weight: 650; color: var(--text); line-height: 1.1; }
+.ht-of { font-size: 10px; color: var(--text-dim); margin-top: 1px; }
+.ht-label { font-size: 11.5px; font-weight: 600; color: var(--text); margin-top: 6px; }
+.ht-note { font-size: 9.5px; color: var(--text-dim); line-height: 1.4; margin-top: 3px; }
+
+.health-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  align-items: center;
+  margin-bottom: 12px;
+}
+.health-controls label {
+  font-size: 11px;
+  color: var(--text-dim);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.health-controls select {
+  background: #11151c;
+  color: var(--text);
+  border: 1px solid var(--panel-border);
+  border-radius: 5px;
+  padding: 3px 6px;
+  font-size: 11px;
+}
+.health-controls select:focus { border-color: var(--accent); }
+.health-check { cursor: pointer; }
+
+/* ── Per-community keyword bars (Metrics tab section + community detail) ───── */
+#view-keywords-section {
+  margin-top: 26px;
+  padding-top: 18px;
+  border-top: 1px solid var(--panel-border);
+}
+.keyword-tile-title {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+.keyword-tile-title .swatch {
+  flex: none;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+}
+.keyword-tile-title button {
+  flex: 1;
+  min-width: 0;
+  text-align: left;
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--text);
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.keyword-tile-title button:hover { color: var(--accent); }
+.keyword-bars { display: block; width: 100%; height: auto; }
+.kw-bar { fill: var(--accent); opacity: 0.85; }
+.kw-bar-track { fill: var(--panel-border); opacity: 0.35; }
+.kw-label { fill: var(--text); font-size: 8.5px; }
+.kw-value { fill: var(--text-dim); font-size: 7.5px; }
+#detail .keyword-bars-wrap { margin: 4px 0 10px; }
+
+/* ── Figures tab ───────────────────────────────────────────────────────── */
+#figures-wrap {
+  top: 16px;
+  left: 16px;
+  right: 16px;
+  bottom: 16px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+}
+#figures-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(420px, 1fr));
+  gap: 14px;
+}
+@media (max-width: 900px) { #figures-grid { grid-template-columns: 1fr; } }
+.figure-card {
+  background: #161a22;
+  border: 1px solid var(--panel-border);
+  border-radius: 8px;
+  padding: 10px 12px 8px;
+  min-width: 0;
+}
+.figure-card .figure-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+  margin-bottom: 4px;
+}
+.figure-card .figure-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+.figure-tag {
+  font-size: 9.5px;
+  padding: 1px 6px;
+  border-radius: 9px;
+  border: 1px solid var(--panel-border);
+  color: var(--text-dim);
+}
+.figure-tag.other-graph { border-color: #ffb14e; color: #ffb14e; }
+.figure-card img, .figure-card object {
+  display: block;
+  width: 100%;
+  height: auto;
+  background: #fff;
+  border-radius: 4px;
+}
+.figures-empty { color: var(--text-dim); font-size: 12px; padding: 8px 0; }
+
+/* Size-band legend: identity never rests on colour alone. */
+.metric-band-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  padding: 4px 0 6px;
+}
+.mbl-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 9.5px;
+  color: var(--text-dim);
+}
+.mbl-item i {
+  width: 9px;
+  height: 9px;
+  border-radius: 2px;
+  flex: none;
+}
+
+.metric-bar-seg { stroke: none; }
+.metric-hist-bar { fill: var(--accent); opacity: 0.85; }
+.metric-scatter-dot { fill-opacity: 0.7; }
+
+#health-table { margin-top: 22px; overflow-x: auto; }
+table.health-table {
+  border-collapse: collapse;
+  font-size: 11px;
+  min-width: 720px;
+}
+table.health-table caption {
+  caption-side: top;
+  text-align: left;
+  font-size: 10.5px;
+  color: var(--text-dim);
+  line-height: 1.4;
+  padding-bottom: 8px;
+  max-width: 640px;
+}
+table.health-table th,
+table.health-table td {
+  border-bottom: 1px solid var(--panel-border);
+  padding: 5px 10px 5px 0;
+  text-align: right;
+  white-space: nowrap;
+}
+table.health-table thead th {
+  color: var(--text-dim);
+  font-weight: 600;
+  font-size: 10px;
+  vertical-align: bottom;
+}
+table.health-table tbody th[scope="row"] { text-align: left; color: var(--text); }
+table.health-table tbody td { color: var(--text-dim); }
+table.health-table tr.active th[scope="row"],
+table.health-table tr.active td { color: var(--text); background: rgba(78, 161, 255, 0.08); }
+
 /* ── Table view ───────────────────────────────────────────────────────── */
 #table-wrap {
   top: 16px;
@@ -806,3 +1095,89 @@ details.about p {
 }
 #tour-footer .tour-primary:hover { filter: brightness(1.05); }
 
+
+/* ── Orientation (rotate / flip) buttons ─────────────────────────────── */
+.orientation-buttons {
+  display: flex;
+  gap: 6px;
+}
+.orientation-buttons button {
+  flex: 1;
+  padding: 5px 0;
+  background: #161a22;
+  color: var(--text);
+  border: 1px solid var(--panel-border);
+  border-radius: 6px;
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  transition: border-color 120ms, color 120ms;
+}
+.orientation-buttons button#orientation-reset {
+  flex: 1.6;
+  font-size: 11px;
+}
+.orientation-buttons button:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+/* ── Export image ─────────────────────────────────────────────────────── */
+.export-options {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 6px;
+}
+.export-options select {
+  min-width: 0;
+}
+.export-actions select {
+  flex: 1;
+  min-width: 0;
+}
+.export-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 6px;
+}
+.control-row .export-check {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  text-transform: none;
+  letter-spacing: 0;
+  color: var(--text);
+  font-size: 12px;
+  cursor: pointer;
+}
+#export-png {
+  white-space: nowrap;
+  padding: 6px 12px;
+  background: #161a22;
+  color: var(--text);
+  border: 1px solid var(--panel-border);
+  border-radius: 6px;
+  font-size: 12px;
+  cursor: pointer;
+  transition: border-color 120ms, color 120ms;
+}
+#export-png:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+#export-png:disabled {
+  opacity: 0.6;
+  cursor: progress;
+}
+
+/* ── Well-connected papers (Connectivity Modifier) filter ────────────── */
+#well-connected-row {
+  flex-wrap: wrap;
+}
+.well-connected-note {
+  flex-basis: 100%;
+  font-size: 11px;
+  color: var(--text-dim);
+}

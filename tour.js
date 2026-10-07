@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Alfredo Hernández Inostroza and the Scientographer contributors
+// SPDX-License-Identifier: MIT
 // Guided tour: a self-contained walkthrough that spotlights each control in
 // turn with a short explanation. It only reads the DOM (and clicks the controls
 // toggle to expand the panel); it does not touch main.js state, so it stays in
@@ -19,9 +21,9 @@ const SEEN_KEY = "mlsm_tour_seen_v1";
 // that ship snapshots).
 const STEPS = [
   {
-    title: "Welcome to the Semantic Map",
+    title: "Welcome to the map",
     body:
-      "This is an interactive map of <strong>~14,500 motor-learning papers</strong>. " +
+      "This is an interactive map of a <strong>citation network</strong>. " +
       "Every dot is one paper; dot size is how often it's cited. Nearby dots are " +
       "related — by text content or by citations, depending on the layout.<br><br>" +
       "This quick tour walks through everything you can do. Use <em>Next</em> / " +
@@ -141,8 +143,7 @@ const STEPS = [
     title: "Also try the topic view",
     body:
       "You're on the <strong>citation-graph</strong> layout. Also try a " +
-      "<strong>topic view</strong> (<strong>Gemini</strong> or " +
-      "<strong>Specter</strong>) from the <strong>Dataset</strong> menu: papers are " +
+      "<strong>topic view</strong> from the <strong>View</strong> menu: papers are " +
       "placed by <strong>text content</strong> and grouped into topics, with extra " +
       "topic tools like clickable topic labels.",
   },
@@ -201,11 +202,12 @@ function isUsable(el) {
   return r.width > 0 && r.height > 0;
 }
 
-// "citation" = the ForceAtlas citation-graph layout; "topic" = the
-// text-embedding layouts (Gemini / Specter).
+// "citation" = the first view (the citation-graph layout); "topic" = any other
+// view (text-embedding layouts such as Gemini or SPECTER2).
 function currentView() {
-  const d = document.getElementById("dataset-select")?.value;
-  return d === "gemini" || d === "specter" ? "topic" : "citation";
+  const sel = document.getElementById("dataset-select");
+  if (!sel || !sel.options.length) return "citation";
+  return sel.selectedIndex > 0 ? "topic" : "citation";
 }
 
 function stepIsAvailable(step) {

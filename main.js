@@ -1,4 +1,6 @@
-// Interactive semantic map viewer.
+// SPDX-FileCopyrightText: 2026 Alfredo Hernández Inostroza and the Scientographer contributors
+// SPDX-License-Identifier: MIT
+// Interactive citation-map viewer.
 // Same architecture as the citation-graph viewer, but node x/y come from a 2D
 // UMAP of text embeddings. There are two selectable DATASETS (see DATASETS
 // below), each built from a different embedding model:
@@ -22,42 +24,64 @@ import { Sigma } from "https://cdn.jsdelivr.net/npm/sigma@2.4.0/+esm";
 // noneLabel (the "ungrouped" bucket). `semantic: true` marks the text-embedding
 // (topic / semantic-cluster) grouping — the one the "Intra-topic citation
 // islands" view operates on. Exactly one grouping per dataset carries it.
-const DATASETS = {
-  specter: {
-    label: "SPECTER2",
-    dir: "data",
-    subtitle: "14,511 papers &middot; UMAP of SPECTER2 embeddings",
+// Single dataset built by scientographer/build_website.py from one
+// GraphML: positions come from the graphml's layout (x/y), the semantic "topic"
+// grouping from the graphml `topic` attribute, and the citation "community"
+// grouping from the graphml `cpm_communities_at_res=*` attribute. The bundle
+// (nodes.json / clusters.json / communities_by_resolution.json /
+// resolution_metrics.json / abstracts.json / edges_*.bin) lives in the
+// `network_data/` sibling directory.
+// Note: the "community" grouping has no static `file` -- unlike every other
+// grouping, it's resolution-indexed (communities_by_resolution.json, one
+// legend per swept Leiden/CPM resolution), so its `state.groupData.community`
+// is populated by setupResolutionMetrics()/applyCommunityResolution() instead
+// of the generic per-grouping fetch loop in loadDataset().
+let DATASETS = {
+  network: {
+    label: "Citation network",
+    dir: "network_data",
+    subtitle: "Citation-network layout",
     groupings: [
-      { key: "topic", label: "Topic", legendLabel: "Topics", file: "topics.json", nodeField: "topic", colorField: "topic_color", noneLabel: "No topic", semantic: true },
-      { key: "cluster", label: "Community", legendLabel: "Communities", file: "communities.json", nodeField: "cluster", colorField: "cluster_color", noneLabel: "No community", citation: true },
-    ],
-  },
-  gemini: {
-    label: "Gemini",
-    dir: "gemini_data",
-    subtitle: "14,511 papers &middot; UMAP of Gemini embeddings",
-    snapshots: true, // has snapshots.json (until-year UMAP layouts)
-    groupings: [
-      { key: "cluster", label: "Cluster", legendLabel: "Clusters", file: "clusters.json", nodeField: "cluster", colorField: "color", noneLabel: "No cluster", semantic: true },
-      { key: "community", label: "Community", legendLabel: "Communities", file: "communities.json", nodeField: "community", colorField: "community_color", noneLabel: "No community", citation: true },
-    ],
-  },
-  // ForceAtlas layout of the *citation graph* (positions come from the graphml's
-  // Gephi ForceAtlas x/y, not a text-embedding UMAP). Same papers/fields as the
-  // gemini dataset; the citation community is the primary grouping (so it's the
-  // default "Color by"), with the semantic cluster available as an alternative.
-  forceatlas: {
-    label: "ForceAtlas",
-    dir: "forceatlas_data",
-    subtitle: "14,511 papers &middot; ForceAtlas layout of the citation graph",
-    snapshots: true, // has snapshots.json (until-year ForceAtlas2 layouts)
-    groupings: [
-      { key: "community", label: "Community", legendLabel: "Communities", file: "communities.json", nodeField: "community", colorField: "community_color", noneLabel: "No community", citation: true },
-      { key: "cluster", label: "Cluster", legendLabel: "Clusters", file: "clusters.json", nodeField: "cluster", colorField: "color", noneLabel: "No cluster", semantic: true },
+      { key: "community", label: "Community", legendLabel: "Communities", nodeField: "community", colorField: "community_color", noneLabel: "No community", citation: true },
+      { key: "cluster", label: "Topic", legendLabel: "Topics", file: "clusters.json", nodeField: "cluster", colorField: "color", noneLabel: "No topic", semantic: true },
     ],
   },
 };
-const DEFAULT_DATASET = "forceatlas";
+let DEFAULT_DATASET = "network";
+
+// build_website.py writes views.json when the site has more than one layout
+// (params.yaml `website.extra_layouts`: e.g. text-embedding maps next to the
+// citation layout). Each view is a dataset as above; `shared_dir` holds the
+// files every view shares (metrics, keywords, figures, abstracts).
+async function loadViewsManifest() {
+  let manifest = null;
+  try {
+    const response = await fetch("views.json");
+    manifest = response.ok ? await response.json() : null;
+  } catch {
+    manifest = null;
+  }
+  if (!manifest || !Array.isArray(manifest.views) || !manifest.views.length) return;
+  const views = {};
+  for (const v of manifest.views) {
+    views[v.key] = {
+      label: v.label,
+      dir: v.dir,
+      subtitle: v.subtitle || "",
+      snapshots: !!v.snapshots,
+      sharedDir: manifest.shared_dir || v.dir,
+      groupings: v.groupings,
+    };
+  }
+  DATASETS = views;
+  DEFAULT_DATASET = views[manifest.default] ? manifest.default : manifest.views[0].key;
+  state.dataset = DEFAULT_DATASET;
+}
+
+// Files shared by every view live in the default view's directory.
+function sharedDir(cfg) {
+  return cfg.sharedDir || cfg.dir;
+}
 
 // ── State ─────────────────────────────────────────────────────────────────
 const state = {
@@ -95,10 +119,39 @@ const state = {
   _intraLayerBuilt: false,
   topicComponents: null, // { compRank, compSizeOf } — see computeTopicComponents
 
-  // Community integration ("Color by → Integration"): per Leiden community, how
-  // much it cites outside itself vs chance. Computed at runtime over the CSR
-  // edges; reset when the dataset changes. See computeCommunityIntegration.
-  communityIntegration: null, // { byId: {cid: {...}}, lo, mid, hi, Q, internalShare }
+  // Resolution-indexed citation-community data (community_quality_metrics.py
+  // via build_website.py): communities_by_resolution.json (per-resolution
+  // legend + true full-network quality metrics) and resolution_metrics.json
+  // (whole-graph metrics vs. resolution, for the Metrics tab). Both null if
+  // the dataset doesn't provide them. See setupResolutionMetrics.
+  communitiesByResolution: null, // { default_resolution, by_resolution: {res: {cid: {...}}} }
+  resolutionMetrics: null, // { default_resolution, resolutions: [{resolution, modularity, ...}] }
+  // The same whole-graph metrics recomputed on the Connectivity-Modifier-remediated
+  // partition (community_quality_metrics_after_connectivity_modifier.py), overlaid as
+  // an "after CM" second series; and the well-connectedness diagnostic + CM before/after
+  // summary (connectivity_metrics.json) driving the connectivity panels. Both null if absent.
+  resolutionMetricsAfterCm: null, // { default_resolution, resolutions: [{resolution, modularity, ...}] }
+  connectivityMetrics: null, // { default_resolution, resolutions: [{resolution, fraction_well_connected_*, node_coverage_*, ...}] }
+  communityResolution: null, // the currently active resolution (string key into by_resolution)
+
+  // community_distributions.json: EVERY community's health metrics per
+  // resolution as parallel arrays -- including the singletons and 2-3 paper
+  // fragments that are too small to be named in the legend, which is exactly
+  // the population the health views exist to expose. null if not provided.
+  communityDistributions: null, // { default_resolution, by_resolution: {res: {community_size:[], ...}} }
+  healthHistogramMetric: "internal_edge_surprise", // metric shown in the histogram
+  healthScatterMetric: "internal_edge_surprise", // y-axis metric of the size-vs-health scatter
+  healthExcludeSingletons: true, // singletons are ~half the rows and pile up at one value
+
+  // community_keywords.json: resolution -> community id -> ranked [{keyword, score}]
+  // (community_keywords.py's corrected TF-IDF, or the site's own TF-IDF fallback --
+  // `source` says which). Drives the keyword bars in the Metrics tab and the
+  // community detail panel. null if absent.
+  communityKeywords: null,
+  // figures.json: pipeline figures (word clouds, ...) copied next to the data by
+  // build_website.py, each tagged with the graph + resolution it was made on.
+  figures: null,
+  figuresFollowResolution: true, // gallery filter: only the selected resolution's figures
 
   // "Until-year" time snapshots: the active dataset's snapshots.json (per-cutoff
   // re-layouts using only papers up to that year; colour/grouping is unchanged).
@@ -106,6 +159,16 @@ const state = {
   // dataset switch. See setupSnapshots / applySnapshot.
   snapshotData: null, // { cutoffs:[...], snapshots:{ "2010": {coords, centroids} } } | null
   snapshot: null, // null (All) | { cutoff, visible:Set(indexStr), centroids:{cluster,community} }
+
+  // Map orientation (the rotate / flip buttons): applied to every coordinate put
+  // into the graph and every centroid read from the data, see orient().
+  orientation: { angle: 0, flipX: false, flipY: false }, // angle in degrees
+
+  // The Connectivity Modifier's verdict per resolution (well_connected.json):
+  // { n, resolutions: { "<r>": base64 bitset } }, decoded lazily into masks.
+  wellConnected: null,
+  wellConnectedMasks: {},
+  wellConnectedOnly: true, // the "Papers" control
 
   // floating-label bookkeeping for the currently-active grouping
   labelMode: "dynamic", // dynamic | always
@@ -123,7 +186,7 @@ const state = {
 };
 
 // Sentinel id for the "ungrouped" bucket (no topic / no community): papers
-// whose group isn't a named entry in topics.json / communities.json.
+// whose group isn't a named entry in the active grouping's data.
 const NONE_ID = "__none__";
 
 // Groupings declared by the active dataset.
@@ -163,15 +226,26 @@ main().catch((err) => {
 async function main() {
   // One-time wiring (event listeners on static DOM); the renderer + per-frame
   // hooks are created lazily on the first loadDataset call.
+  await loadViewsManifest();
   initShiftTracking();
   initControls();
+  initOrientationControls();
+  initExportControls();
+  initWellConnectedControl();
   initTabs();
   initGlobalFilters();
   initYearControls();
   initDatasetSelector();
   initSnapshotControl();
+  initCommunityResolutionControl();
 
   await loadDataset(DEFAULT_DATASET);
+
+  // Must come after an await: initHealthControls() reads HEALTH_METRICS, a
+  // module-level const declared further down the file, so calling it in this
+  // function's synchronous prologue (which runs during module evaluation) would
+  // hit it in the temporal dead zone and throw ReferenceError.
+  initHealthControls();
 
   document.getElementById("loading")?.classList.add("hidden");
 }
@@ -182,7 +256,10 @@ async function loadDataset(name) {
   const cfg = DATASETS[name];
   state.dataset = name;
 
-  const groupingFetches = cfg.groupings.map((g) =>
+  // "community" has no static file (see DATASETS) -- its data is resolution-
+  // indexed and populated below by setupResolutionMetrics().
+  const fileGroupings = cfg.groupings.filter((g) => g.file);
+  const groupingFetches = fileGroupings.map((g) =>
     fetch(`${cfg.dir}/${g.file}`).then((r) => r.json())
   );
   const [nodesPayload, outBuf, inBuf, ...groupingPayloads] = await Promise.all([
@@ -201,11 +278,18 @@ async function loadDataset(name) {
   // Per-grouping data + a fresh (empty) mute set.
   state.groupData = {};
   state.muted = {};
-  cfg.groupings.forEach((g, i) => {
-    state.groupData[g.key] = groupingPayloads[i];
-    state.muted[g.key] = new Set();
-  });
+  cfg.groupings.forEach((g) => { state.muted[g.key] = new Set(); });
+  fileGroupings.forEach((g, i) => { state.groupData[g.key] = groupingPayloads[i]; });
   state.colorBy = cfg.groupings[0].key;
+
+  state.wellConnected = null;
+  state.wellConnectedMasks = {};
+  try {
+    const response = await fetch(`${cfg.dir}/well_connected.json`);
+    state.wellConnected = response.ok ? await response.json() : null;
+  } catch {
+    state.wellConnected = null;
+  }
 
   // Reset transient view state and the abstracts cache (per-dataset).
   state.selectedNode = null;
@@ -218,13 +302,21 @@ async function loadDataset(name) {
   // clear in buildGraph() already dropped the intra edge layer.
   state.topicComponents = null;
   state._intraLayerBuilt = false;
-  state.communityIntegration = null; // belongs to the previous dataset's communities
   state.snapshotData = null; // belongs to the previous dataset
   state.snapshot = null; // back to the full "now" layout
 
   document.getElementById("subtitle").innerHTML = cfg.subtitle;
 
   buildIndex();
+  // Populates state.groupData.community (resolution-indexed; must run before
+  // buildLegends()/renderGroupLabels() below) plus the Metrics tab + resolution
+  // selector. A no-op (leaves "community" grouping empty) if the dataset
+  // doesn't provide communities_by_resolution.json.
+  await setupResolutionMetrics(cfg);
+  // Independent of the metrics: a dataset can ship figures without any
+  // community analysis, and vice versa.
+  await setupFigures(cfg);
+
   buildGraph(); // clears + repopulates the graph (and any edge layers)
   if (!state.renderer) {
     initSigma();
@@ -254,6 +346,12 @@ async function loadDataset(name) {
 function initDatasetSelector() {
   const sel = document.getElementById("dataset-select");
   if (!sel) return;
+  const keys = Object.keys(DATASETS);
+  sel.innerHTML = keys
+    .map((k) => `<option value="${escapeHtml(k)}">${escapeHtml(DATASETS[k].label || k)}</option>`)
+    .join("");
+  const row = sel.closest(".control-row");
+  if (row) row.hidden = keys.length < 2;
   sel.value = state.dataset;
   sel.addEventListener("change", async (e) => {
     sel.disabled = true;
@@ -326,11 +424,12 @@ function applySnapshot(value) {
     for (let i = 0; i < nodes.length; i++) {
       const c = coords[nodes[i].id];
       if (!c) continue; // published after the cutoff (or unembedded) → hidden
-      state.graph.setNodeAttribute(String(i), "x", c[0]);
-      state.graph.setNodeAttribute(String(i), "y", c[1]);
+      const [x, y] = orient(c[0], c[1]);
+      state.graph.setNodeAttribute(String(i), "x", x);
+      state.graph.setNodeAttribute(String(i), "y", y);
       visible.add(String(i));
-      sx += c[0];
-      sy += c[1];
+      sx += x;
+      sy += y;
     }
     // Park hidden papers on the visible centroid: they don't render, but sigma's
     // layout extent (and thus the camera reset) is computed over *all* nodes, so
@@ -342,18 +441,7 @@ function applySnapshot(value) {
       state.graph.setNodeAttribute(String(i), "x", cx);
       state.graph.setNodeAttribute(String(i), "y", cy);
     }
-    // Per-grouping member counts within this snapshot, so labels can be limited
-    // to groups that are actually substantial in the given year (see MIN_SNAPSHOT
-    // _LABEL in positionLabels). Computed here once per snapshot switch.
-    const counts = {};
-    for (const g of activeGroupings()) counts[g.key] = {};
-    for (const idxStr of visible) {
-      const r = nodes[parseInt(idxStr, 10)];
-      for (const g of activeGroupings()) {
-        const gid = String(r[g.nodeField]);
-        counts[g.key][gid] = (counts[g.key][gid] || 0) + 1;
-      }
-    }
+
     // Apply the snapshot's own per-node sizes (forceatlas / Gephi exports).
     if (snap.sizes) {
       for (const idxStr of visible) {
@@ -364,7 +452,8 @@ function applySnapshot(value) {
         state.graph.setNodeAttribute(idxStr, "_baseSize", rs);
       }
     }
-    state.snapshot = { cutoff: value, visible, centroids: snap.centroids || {}, counts };
+    state.snapshot = { cutoff: value, visible, coords, centroids: {}, counts: {} };
+    computeSnapshotGroupStats();
   }
 
   state.renderer.refresh(); // recomputes the layout extent for the new positions
@@ -372,11 +461,49 @@ function applySnapshot(value) {
   scheduleRefilter();
 }
 
+// Per-grouping member counts and centroids within the active snapshot, from the
+// snapshot's own coordinates: labels sit at the centre of each group's papers
+// that year and are limited to groups substantial enough then (MIN_SNAPSHOT_LABEL
+// in positionLabels). Recomputed when the community resolution changes, since
+// the communities themselves change with it.
+function computeSnapshotGroupStats() {
+  const snapshot = state.snapshot;
+  if (!snapshot) return;
+  const nodes = state.nodesData.nodes;
+  const counts = {}, sums = {};
+  for (const g of activeGroupings()) {
+    counts[g.key] = {};
+    sums[g.key] = {};
+  }
+  for (const idxStr of snapshot.visible) {
+    if (removedByModifier(parseInt(idxStr, 10))) continue;
+    const r = nodes[parseInt(idxStr, 10)];
+    const c = snapshot.coords[r.id];
+    for (const g of activeGroupings()) {
+      const gid = String(r[g.nodeField]);
+      counts[g.key][gid] = (counts[g.key][gid] || 0) + 1;
+      const a = sums[g.key][gid] || (sums[g.key][gid] = [0, 0]);
+      a[0] += c[0];
+      a[1] += c[1];
+    }
+  }
+  const centroids = {};
+  for (const key of Object.keys(sums)) {
+    centroids[key] = {};
+    for (const [gid, [sx, sy]] of Object.entries(sums[key])) {
+      centroids[key][gid] = [sx / counts[key][gid], sy / counts[key][gid]];
+    }
+  }
+  snapshot.counts = counts;
+  snapshot.centroids = centroids;
+}
+
 function restoreBasePositions() {
   const nodes = state.nodesData.nodes;
   for (let i = 0; i < nodes.length; i++) {
-    state.graph.setNodeAttribute(String(i), "x", nodes[i].x);
-    state.graph.setNodeAttribute(String(i), "y", nodes[i].y);
+    const [x, y] = orient(nodes[i].x, nodes[i].y);
+    state.graph.setNodeAttribute(String(i), "x", x);
+    state.graph.setNodeAttribute(String(i), "y", y);
   }
 }
 
@@ -403,12 +530,479 @@ function groupCentroid(key, gid) {
   const g = grouping(key);
   const c = g && g.data[gid];
   if (!c) return null;
+  let cen = c.centroid;
   if (state.snapshot) {
     const ov = state.snapshot.centroids[key];
-    return ov ? ov[gid] || null : c.centroid;
+    cen = ov ? ov[gid] || null : c.centroid;
   }
-  return c.centroid;
+  return cen ? orient(cen[0], cen[1]) : null;
 }
+
+// ── Map orientation (rotate / flip) ─────────────────────────────────────────
+// The layout's orientation is arbitrary, so the viewer can turn and mirror it.
+// Rather than rotating the camera (which a camera reset would undo), the
+// transform is applied to the coordinates themselves: flip first, then rotate
+// about the origin. Sigma re-fits the view to the new extent on refresh.
+function orient(x, y) {
+  const o = state.orientation;
+  if (o.flipX) x = -x;
+  if (o.flipY) y = -y;
+  if (!o.angle) return [x, y];
+  const t = (o.angle * Math.PI) / 180;
+  const cos = Math.cos(t), sin = Math.sin(t);
+  return [x * cos - y * sin, x * sin + y * cos];
+}
+
+// Re-place every node under the current orientation (the active time snapshot's
+// positions, or the base layout).
+function applyOrientation() {
+  applySnapshot(state.snapshot ? state.snapshot.cutoff : "all");
+}
+
+// ── Export the map as a high-resolution PNG ─────────────────────────────────
+// Redraws what the map shows (nodes that pass the current filters, year range,
+// hidden communities and time snapshot, in their current colours) onto an
+// offscreen canvas at the chosen size, with optional citation edges (straight,
+// or curved like Gephi's) and the labels of the communities that have visible
+// papers. "Current view" exports the visible window; "Whole map" every visible
+// node, framed to fit.
+const EXPORT_FONT = '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+const EXPORT_EDGE_ALPHA = 0.16;
+const EXPORT_CURVATURE = 0.25; // control-point offset as a fraction of edge length
+
+function initExportControls() {
+  const button = document.getElementById("export-png");
+  if (!button) return;
+  button.addEventListener("click", async () => {
+    const label = button.textContent;
+    button.disabled = true;
+    button.textContent = "Exporting…";
+    // Let the button repaint before the (synchronous) drawing starts.
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    try {
+      await exportMapPng({
+        area: document.getElementById("export-area").value,
+        longSide: parseInt(document.getElementById("export-size").value, 10),
+        edges: document.getElementById("export-edges").value,
+        nodeScale: parseFloat(document.getElementById("export-nodes").value),
+        labels: document.getElementById("export-labels").checked,
+      });
+    } catch (err) {
+      console.error(err);
+      alert(`Export failed: ${err.message}`);
+    } finally {
+      button.disabled = false;
+      button.textContent = label;
+    }
+  });
+}
+
+// Every node as the map currently draws it: viewport position, on-screen radius
+// and colour, or null when it is hidden.
+function visibleNodeDrawData() {
+  const renderer = state.renderer;
+  const out = new Array(state.graph.order).fill(null);
+  state.graph.forEachNode((node, attrs) => {
+    const shown = nodeReducer(node, attrs);
+    if (shown.hidden) return;
+    const pt = renderer.graphToViewport({ x: attrs.x, y: attrs.y });
+    out[parseInt(node, 10)] = {
+      x: pt.x,
+      y: pt.y,
+      r: renderer.scaleSize(shown.size),
+      color: shown.color,
+      z: shown.zIndex || 0,
+    };
+  });
+  return out;
+}
+
+async function exportMapPng({ area, longSide, edges, nodeScale, labels }) {
+  const nodes = visibleNodeDrawData();
+  const { width: viewWidth, height: viewHeight } = state.renderer.getDimensions();
+
+  // The exported region, in viewport pixels.
+  let x0 = 0, y0 = 0, x1 = viewWidth, y1 = viewHeight;
+  if (area === "all") {
+    x0 = Infinity; y0 = Infinity; x1 = -Infinity; y1 = -Infinity;
+    for (const n of nodes) {
+      if (!n) continue;
+      x0 = Math.min(x0, n.x - n.r); y0 = Math.min(y0, n.y - n.r);
+      x1 = Math.max(x1, n.x + n.r); y1 = Math.max(y1, n.y + n.r);
+    }
+    if (!isFinite(x0)) throw new Error("no visible papers to export");
+    const pad = 0.03 * Math.max(x1 - x0, y1 - y0);
+    x0 -= pad; y0 -= pad; x1 += pad; y1 += pad;
+  }
+  const inRegion = (n) => n && n.x + n.r >= x0 && n.x - n.r <= x1 && n.y + n.r >= y0 && n.y - n.r <= y1;
+  const scale = longSide / Math.max(x1 - x0, y1 - y0);
+  // Sizes (radius, line width, font) are kept in proportion to the screen when
+  // exporting the current view; for the whole map they follow the same scale but
+  // never shrink below what reads at the exported size.
+  const sizeScale = area === "all" ? Math.max(scale, longSide / Math.max(viewWidth, viewHeight)) : scale;
+
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.round((x1 - x0) * scale);
+  canvas.height = Math.round((y1 - y0) * scale);
+  const ctx = canvas.getContext("2d");
+  if (!ctx) throw new Error(`the browser could not allocate a ${canvas.width}×${canvas.height} canvas`);
+  const px = (n) => [(n.x - x0) * scale, (n.y - y0) * scale];
+
+  ctx.fillStyle = getComputedStyle(document.body).backgroundColor || "#0e1116";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  // Edges: citations between two visible papers with at least one end in the
+  // region, coloured by the citing paper, one path per colour.
+  if (edges !== "none" && state.outCSR) {
+    const byColor = new Map();
+    for (let i = 0; i < state.outCSR.n; i++) {
+      const source = nodes[i];
+      if (!source) continue;
+      for (const t of csrNeighbors(state.outCSR, i)) {
+        const target = nodes[t];
+        if (!target || (!inRegion(source) && !inRegion(target))) continue;
+        if (!byColor.has(source.color)) byColor.set(source.color, []);
+        byColor.get(source.color).push(i, t);
+      }
+    }
+    ctx.globalAlpha = EXPORT_EDGE_ALPHA;
+    ctx.lineWidth = Math.max(0.5, 0.35 * sizeScale);
+    for (const [color, pairs] of byColor) {
+      ctx.strokeStyle = color;
+      ctx.beginPath();
+      for (let k = 0; k < pairs.length; k += 2) {
+        const [sx, sy] = px(nodes[pairs[k]]);
+        const [tx, ty] = px(nodes[pairs[k + 1]]);
+        ctx.moveTo(sx, sy);
+        if (edges === "curved") {
+          // Gephi-style arc: bend to the same side of every source→target line.
+          const mx = (sx + tx) / 2, my = (sy + ty) / 2;
+          ctx.quadraticCurveTo(mx + (ty - sy) * EXPORT_CURVATURE, my - (tx - sx) * EXPORT_CURVATURE, tx, ty);
+        } else {
+          ctx.lineTo(tx, ty);
+        }
+      }
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // Nodes (nodeScale 0 = edges only), raised ones (selected / highlighted) last.
+  const order = [];
+  for (let i = 0; i < nodes.length; i++) if (inRegion(nodes[i])) order.push(i);
+  order.sort((a, b) => nodes[a].z - nodes[b].z);
+  if (nodeScale > 0) {
+    for (const i of order) {
+      const n = nodes[i];
+      const [x, y] = px(n);
+      ctx.fillStyle = n.color;
+      ctx.beginPath();
+      ctx.arc(x, y, Math.max(0.6, n.r * sizeScale * nodeScale), 0, 2 * Math.PI);
+      ctx.fill();
+    }
+  }
+
+  // Labels of the active grouping's communities with visible papers in the
+  // region, at the centre of those papers, largest first, never overlapping.
+  const g = labels ? grouping(state.colorBy) : null;
+  if (g) {
+    const sums = new Map();
+    for (const i of order) {
+      const gid = String(state.nodesData.nodes[i][g.nodeField]);
+      if (!g.data[gid]) continue;
+      const [x, y] = px(nodes[i]);
+      const a = sums.get(gid) || { x: 0, y: 0, n: 0 };
+      a.x += x; a.y += y; a.n += 1;
+      sums.set(gid, a);
+    }
+    const fontSize = 13 * sizeScale;
+    ctx.font = `600 ${fontSize}px ${EXPORT_FONT}`;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.lineJoin = "round"; // a mitred halo spikes on letters such as M
+    ctx.miterLimit = 2;
+    const placed = [];
+    const gap = 3 * sizeScale;
+    const groupIds = [...sums.keys()].sort((a, b) => g.data[b].size - g.data[a].size);
+    for (const gid of groupIds) {
+      const { x, y, n } = sums.get(gid);
+      const text = g.data[gid].name;
+      const w = ctx.measureText(text).width;
+      // Keep the whole label inside the image.
+      const margin = gap + 3 * sizeScale;
+      const cx = Math.min(Math.max(x / n, w / 2 + margin), canvas.width - w / 2 - margin);
+      const cy = Math.min(Math.max(y / n, fontSize / 2 + margin), canvas.height - fontSize / 2 - margin);
+      const box = { l: cx - w / 2 - gap, r: cx + w / 2 + gap, t: cy - fontSize / 2 - gap, b: cy + fontSize / 2 + gap };
+      if (placed.some((o) => box.l < o.r && box.r > o.l && box.t < o.b && box.b > o.t)) continue;
+      placed.push(box);
+      ctx.lineWidth = 3 * sizeScale; // dark halo keeps text readable over edges
+      ctx.strokeStyle = "rgba(0,0,0,0.75)";
+      ctx.strokeText(text, cx, cy);
+      ctx.fillStyle = g.data[gid].color || "#e6e9ef";
+      ctx.fillText(text, cx, cy);
+    }
+  }
+
+  const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/png"));
+  if (!blob) throw new Error("the browser could not encode the PNG (try a smaller size)");
+  const resolution = state.colorBy === "community" && state.communityResolution != null
+    ? `-resolution-${state.communityResolution}` : "";
+  const link = document.createElement("a");
+  link.href = URL.createObjectURL(blob);
+  link.download = `citation-map${resolution}-${canvas.width}x${canvas.height}.png`;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(link.href), 10000);
+}
+
+function initOrientationControls() {
+  const act = {
+    "rotate-left": (o) => { o.angle = (o.angle + 15) % 360; },
+    "rotate-right": (o) => { o.angle = (o.angle + 345) % 360; },
+    "flip-horizontal": (o) => { o.flipX = !o.flipX; o.angle = (360 - o.angle) % 360; },
+    "flip-vertical": (o) => { o.flipY = !o.flipY; o.angle = (360 - o.angle) % 360; },
+    "orientation-reset": (o) => { o.angle = 0; o.flipX = false; o.flipY = false; },
+  };
+  for (const [id, change] of Object.entries(act)) {
+    document.getElementById(id)?.addEventListener("click", () => {
+      change(state.orientation);
+      applyOrientation();
+    });
+  }
+}
+
+// ── Resolution-indexed citation communities ─────────────────────────────────
+// One-time: wire the "Community resolution" dropdown (options are rebuilt per
+// dataset in setupResolutionMetrics).
+function initCommunityResolutionControl() {
+  const sel = document.getElementById("community-resolution");
+  if (!sel) return;
+  sel.addEventListener("change", (e) => applyCommunityResolution(e.target.value));
+}
+
+// Per-dataset: fetch communities_by_resolution.json + resolution_metrics.json
+// (both optional -- a dataset without community_quality_metrics.py output
+// simply keeps the "community" grouping empty and hides the Metrics tab /
+// resolution selector). On success, seeds state.groupData.community with the
+// default resolution's legend (this must happen before buildLegends() /
+// renderGroupLabels() in loadDataset) and renders the Metrics tab's charts.
+async function setupResolutionMetrics(cfg) {
+  state.communitiesByResolution = null;
+  state.resolutionMetrics = null;
+  state.communityResolution = null;
+  state.groupData.community = {}; // safe default: no named communities
+
+  const tab = document.getElementById("tab-metrics");
+  const row = document.getElementById("community-resolution-row");
+  const sel = document.getElementById("community-resolution");
+  if (tab) tab.hidden = true;
+  if (row) row.hidden = true;
+
+  state.resolutionMetricsAfterCm = null;
+  state.connectivityMetrics = null;
+  state.communityKeywords = null;
+
+  let commByRes = null, resMetrics = null, distributions = null;
+  let resMetricsAfterCm = null, connectivityMetrics = null, communityKeywords = null;
+  try {
+    [commByRes, resMetrics, distributions, resMetricsAfterCm, connectivityMetrics, communityKeywords] = await Promise.all([
+      fetch(`${cfg.dir}/communities_by_resolution.json`).then((r) => (r.ok ? r.json() : null)),
+      fetch(`${sharedDir(cfg)}/resolution_metrics.json`).then((r) => (r.ok ? r.json() : null)),
+      // Optional: every community's health metrics, including the ones too small
+      // to appear in the legend. Absent => the per-community health views are
+      // skipped but the whole-graph charts still render.
+      fetch(`${sharedDir(cfg)}/community_distributions.json`).then((r) => (r.ok ? r.json() : null)),
+      // Optional: the same whole-graph metrics after Connectivity-Modifier
+      // remediation (a second "after CM" line), and the well-connectedness
+      // diagnostic + CM before/after summary. Absent => those overlays/panels
+      // are skipped, everything else renders unchanged.
+      fetch(`${sharedDir(cfg)}/resolution_metrics_after_cm.json`).then((r) => (r.ok ? r.json() : null)),
+      fetch(`${sharedDir(cfg)}/connectivity_metrics.json`).then((r) => (r.ok ? r.json() : null)),
+      // Optional: per-community distinguishing keywords (bars in the Metrics
+      // tab + detail panel). Absent => the legend's plain keyword list is used.
+      fetch(`${sharedDir(cfg)}/community_keywords.json`).then((r) => (r.ok ? r.json() : null)),
+    ]);
+  } catch {
+    commByRes = null;
+    resMetrics = null;
+    distributions = null;
+    resMetricsAfterCm = null;
+    connectivityMetrics = null;
+    communityKeywords = null;
+  }
+  // The legend is the one required file: it carries every resolution the graph
+  // has. The whole-graph metrics are optional (a graph without
+  // community_quality_metrics.py output still gets the resolution dropdown).
+  if (!commByRes || !Object.keys(commByRes.by_resolution || {}).length) return;
+
+  state.communitiesByResolution = commByRes;
+  state.resolutionMetrics = resMetrics;
+  state.communityDistributions = distributions;
+  state.resolutionMetricsAfterCm = resMetricsAfterCm;
+  state.connectivityMetrics = connectivityMetrics;
+  state.communityKeywords = communityKeywords;
+
+  const resolutions = Object.keys(commByRes.by_resolution).sort((a, b) => parseFloat(a) - parseFloat(b));
+  const defaultRes = commByRes.default_resolution && commByRes.by_resolution[commByRes.default_resolution]
+    ? commByRes.default_resolution
+    : resolutions[0];
+
+  if (sel) {
+    sel.innerHTML = resolutions
+      .map((r) => `<option value="${r}">${r} (${Object.keys(commByRes.by_resolution[r]).length.toLocaleString()} communities)</option>`)
+      .join("");
+    sel.value = defaultRes;
+  }
+
+  // Seed groupData directly (no need to rewrite per-node community/
+  // community_color: build_website.py already baked those at this same
+  // default resolution). applyCommunityResolution() handles later switches.
+  state.communityResolution = defaultRes;
+  state.groupData.community = communityLegend(defaultRes);
+  updateWellConnectedRow();
+  refreshResolutionOptions();
+  // Switching views keeps the resolution the user picked, when this view has it.
+  if (state.chosenResolution && state.chosenResolution !== defaultRes && commByRes.by_resolution[state.chosenResolution]) {
+    applyCommunityResolution(state.chosenResolution);
+  }
+
+  if (row) row.hidden = false;
+  if (tab) tab.hidden = !(resMetrics || communityKeywords);
+  renderResolutionMetricsPanel();
+  renderCommunityHealthPanel();
+  renderKeywordsSection();
+}
+
+// ── Well-connected papers (Connectivity Modifier) ──────────────────────────
+// At each resolution the Connectivity Modifier keeps the papers that sit in a
+// well-connected community; the "Well-connected papers only" control hides the
+// rest. Resolutions the Modifier skipped have no mask, and every paper shows.
+function wellConnectedMask(resolution) {
+  const wc = state.wellConnected;
+  if (!wc || resolution == null || !wc.resolutions[resolution]) return null;
+  if (!state.wellConnectedMasks[resolution]) {
+    const bytes = Uint8Array.from(atob(wc.resolutions[resolution]), (c) => c.charCodeAt(0));
+    const mask = new Uint8Array(wc.n);
+    for (let i = 0; i < wc.n; i++) mask[i] = (bytes[i >> 3] >> (i & 7)) & 1;
+    state.wellConnectedMasks[resolution] = mask;
+  }
+  return state.wellConnectedMasks[resolution];
+}
+
+function activeWellConnectedMask() {
+  return state.wellConnectedOnly ? wellConnectedMask(state.communityResolution) : null;
+}
+
+// True when the filter hides this paper (index i) at the current resolution.
+function removedByModifier(i) {
+  const mask = activeWellConnectedMask();
+  return mask !== null && !mask[i];
+}
+
+// The community legend at a resolution: with the filter on, only communities
+// that keep well-connected papers, sized by them.
+function communityLegend(resolution) {
+  const legend = state.communitiesByResolution?.by_resolution[resolution];
+  if (!legend || !state.wellConnectedOnly || !wellConnectedMask(resolution)) return legend;
+  const kept = {};
+  for (const [cid, entry] of Object.entries(legend)) {
+    const size = entry.well_connected_size;
+    if (size == null || size > 0) kept[cid] = size == null ? entry : { ...entry, size, all_papers: entry.size };
+  }
+  return kept;
+}
+
+function updateWellConnectedRow() {
+  const row = document.getElementById("well-connected-row");
+  if (!row) return;
+  row.hidden = !state.wellConnected;
+  const note = document.getElementById("well-connected-note");
+  if (!state.wellConnected || !note) return;
+  const mask = wellConnectedMask(state.communityResolution);
+  if (!mask) {
+    note.textContent = "No Connectivity Modifier result at this resolution: all papers shown.";
+    return;
+  }
+  let kept = 0;
+  for (let i = 0; i < mask.length; i++) kept += mask[i];
+  note.textContent = state.wellConnectedOnly
+    ? `${kept.toLocaleString()} of ${mask.length.toLocaleString()} papers are in well-connected communities.`
+    : `Showing all papers; ${(mask.length - kept).toLocaleString()} are outside well-connected communities.`;
+}
+
+function refreshResolutionOptions() {
+  const sel = document.getElementById("community-resolution");
+  if (!sel || !state.communitiesByResolution) return;
+  for (const option of sel.options) {
+    const legend = communityLegend(option.value) || {};
+    option.textContent = `${option.value} (${Object.keys(legend).length.toLocaleString()} communities)`;
+  }
+}
+
+function initWellConnectedControl() {
+  const box = document.getElementById("well-connected-only");
+  if (!box) return;
+  box.checked = state.wellConnectedOnly;
+  box.addEventListener("change", (e) => {
+    state.wellConnectedOnly = e.target.checked;
+    if (state.communityResolution != null) applyCommunityResolution(state.communityResolution);
+  });
+}
+
+// Switch which resolution's Leiden/CPM communities colour the map: recomputes
+// every node's `community`/`community_color`, swaps the legend data, and
+// (unless called during initial setup) refreshes the map + open panels.
+function applyCommunityResolution(resolution) {
+  const commByRes = state.communitiesByResolution;
+  if (!(commByRes && commByRes.by_resolution[resolution])) return;
+  state.communityResolution = resolution;
+  const legend = communityLegend(resolution);
+
+  state.communityResolution = resolution;
+  state.chosenResolution = resolution;
+  for (const r of state.nodesData.nodes) {
+    const cid = r.communities && r.communities[resolution] != null ? r.communities[resolution] : -1;
+    r.community = cid;
+    const entry = legend[String(cid)];
+    r.community_color = entry ? entry.color : OUTLIER_COLOR_JS;
+  }
+  state.groupData.community = legend;
+  state.muted.community = new Set();
+  computeSnapshotGroupStats();
+  updateWellConnectedRow();
+  refreshResolutionOptions();
+
+  const sel = document.getElementById("community-resolution");
+  if (sel && sel.value !== resolution) sel.value = resolution;
+
+  // Keep the Metrics tab's per-resolution views and the figure gallery in step
+  // with the map.
+  if (state.resolutionMetrics) {
+    renderSelectedResolutionHealth();
+    renderHealthSummaryStrip();
+  }
+  renderKeywordsSection();
+  renderFiguresGallery();
+
+  if (!state.renderer) return; // called before the graph exists (initial load)
+
+  buildLegend("community");
+  if (state.colorBy === "community" || state.colorBy === "integration") renderGroupLabels();
+  // A community/integration detail panel showing the previous resolution's
+  // data would now be stale -- safest to close it rather than show a mismatch.
+  const detail = document.getElementById("detail");
+  if (detail && !detail.hidden) {
+    hideDetail();
+    clearSelection();
+  }
+  state.renderer.refresh();
+  scheduleRefilter();
+}
+
+// Mirrors OUTLIER_COLOR in build_website.py, for papers with no community at
+// the newly-selected resolution.
+const OUTLIER_COLOR_JS = "#cccccc";
 
 // ── CSR helpers ───────────────────────────────────────────────────────────
 function parseCSR(buf) {
@@ -466,9 +1060,10 @@ function buildGraph() {
   for (let i = 0; i < nodes.length; i++) {
     const r = nodes[i];
     const size = nodeRenderSize(r);
+    const [x, y] = orient(r.x, r.y);
     state.graph.addNode(String(i), {
-      x: r.x,
-      y: r.y,
+      x,
+      y,
       size,
       color: nodeColor(r), // default color = first grouping
       label: "",
@@ -539,6 +1134,10 @@ function nodeReducer(node, attrs) {
   }
   // Two independent, stacking mutes (named groups + the ungrouped bucket).
   if (nodeHiddenByMute(r)) {
+    a.hidden = true;
+    return a;
+  }
+  if (removedByModifier(parseInt(node, 10))) {
     a.hidden = true;
     return a;
   }
@@ -646,6 +1245,7 @@ function clamp01(x) {
 const LABEL_RATIO_ALL = 0.12; // camera ratio at/below which all labels show
 const LABEL_RATIO_FEW = 1.2; // ratio at/above which only the base set shows
 const LABEL_BASE_COUNT = 5; // labels always shown when fully zoomed out
+const LABEL_GAP = 4; // px kept clear around each label in dynamic mode
 // In a time snapshot, only label a topic/community that has at least this many
 // papers in that year — keeps early-year maps from being labelled for groups
 // that barely exist yet.
@@ -677,8 +1277,19 @@ function positionLabels() {
   // years aren't cluttered with labels for groups of a handful of papers.
   const snapCentroids = state.snapshot ? state.snapshot.centroids[state.colorBy] : null;
   const snapCounts = state.snapshot ? state.snapshot.counts[state.colorBy] : null;
+  const labelGrouping = grouping(state.colorBy);
 
-  for (const gid of Object.keys(state.activeLabelEls)) {
+  // Dynamic mode never lets labels overlap: they are placed largest group first
+  // (the hovered / selected node's group ahead of all), and a label that would
+  // cover one already placed is skipped. Zooming in spreads the groups apart, so
+  // more labels fit. "Always visible" shows every label regardless.
+  const avoidOverlap = state.labelMode !== "always";
+  const placed = [];
+  const priority = [activeGroupOf(state.hoveredNode), activeGroupOf(state.selectedNode)]
+    .filter((gid) => gid != null && state.activeLabelEls[gid]);
+  const order = [...new Set([...priority, ...state.activeLabelOrder])];
+
+  for (const gid of order) {
     const el = state.activeLabelEls[gid];
     if (!visible.has(gid)) {
       el.style.display = "none";
@@ -688,19 +1299,43 @@ function positionLabels() {
       el.style.display = "none";
       continue;
     }
-    const c = state.activeLabelData[gid];
-    const centroid = snapCentroids ? snapCentroids[gid] : c.centroid;
-    if (!centroid) {
+    // A community hidden in the legend takes its label with it.
+    if (labelGrouping && labelGrouping.muted.has(parseInt(gid, 10))) {
       el.style.display = "none";
       continue;
     }
-    const pt = state.renderer.graphToViewport({ x: centroid[0], y: centroid[1] });
+    const c = state.activeLabelData[gid];
+    const raw = snapCentroids ? snapCentroids[gid] : c.centroid;
+    if (!raw) {
+      el.style.display = "none";
+      continue;
+    }
+    const [cx, cy] = orient(raw[0], raw[1]);
+    const pt = state.renderer.graphToViewport({ x: cx, y: cy });
     // Cull labels whose centroid is well outside the viewport.
     if (pt.x < -margin || pt.y < -margin || pt.x > width + margin || pt.y > height + margin) {
       el.style.display = "none";
       continue;
     }
     el.style.display = "";
+    if (avoidOverlap) {
+      // A label's size never changes, so measure it once.
+      if (el._width == null) {
+        el._width = el.offsetWidth;
+        el._height = el.offsetHeight;
+      }
+      const box = {
+        left: pt.x - el._width / 2 - LABEL_GAP,
+        right: pt.x + el._width / 2 + LABEL_GAP,
+        top: pt.y - el._height / 2 - LABEL_GAP,
+        bottom: pt.y + el._height / 2 + LABEL_GAP,
+      };
+      if (placed.some((b) => box.left < b.right && box.right > b.left && box.top < b.bottom && box.bottom > b.top)) {
+        el.style.display = "none";
+        continue;
+      }
+      placed.push(box);
+    }
     el.style.transform = `translate(-50%, -50%) translate(${pt.x}px, ${pt.y}px)`;
   }
 }
@@ -714,7 +1349,8 @@ function visibleLabelIds() {
   const count = Math.round(LABEL_BASE_COUNT + f * (order.length - LABEL_BASE_COUNT));
   const visible = new Set(order.slice(0, Math.max(LABEL_BASE_COUNT, count)));
 
-  // Always reveal the group of the hovered/selected node.
+  // Always reveal the group of the hovered/selected node (placed first, so it is
+  // never the one skipped for overlapping).
   for (const gid of [activeGroupOf(state.hoveredNode), activeGroupOf(state.selectedNode)]) {
     if (gid != null && state.activeLabelData[gid]) visible.add(gid);
   }
@@ -766,8 +1402,29 @@ function renderGroupLabels() {
 }
 
 // ── Hover tooltip ─────────────────────────────────────────────────────────
-function initHover() {
+// Shared by node hover (below) and the Metrics-tab chart crosshairs.
+function showTooltip(html) {
   const tt = document.getElementById("tooltip");
+  tt.innerHTML = html;
+  tt.hidden = false;
+}
+function hideTooltipEl() {
+  document.getElementById("tooltip").hidden = true;
+}
+function positionTooltipAt(e) {
+  const tt = document.getElementById("tooltip");
+  if (tt.hidden) return;
+  const pad = 14;
+  let x = e.clientX + pad;
+  let y = e.clientY + pad;
+  const r = tt.getBoundingClientRect();
+  if (x + r.width > window.innerWidth) x = e.clientX - r.width - pad;
+  if (y + r.height > window.innerHeight) y = e.clientY - r.height - pad;
+  tt.style.left = x + "px";
+  tt.style.top = y + "px";
+}
+
+function initHover() {
   const container = document.getElementById("sigma-container");
 
   state.renderer.on("enterNode", ({ node }) => {
@@ -776,30 +1433,20 @@ function initHover() {
     const auths = (r.authors || "").split("|");
     const shown = auths.slice(0, 3).join(", ");
     const more = auths.length > 3 ? " et al." : "";
-    tt.innerHTML =
+    showTooltip(
       `<strong>${escapeHtml(r.title)}</strong>` +
-      `<div class="tt-meta">${r.year ?? ""}${r.year ? " &middot; " : ""}${escapeHtml(shown)}${more}</div>`;
-    tt.hidden = false;
+      `<div class="tt-meta">${r.year ?? ""}${r.year ? " &middot; " : ""}${escapeHtml(shown)}${more}</div>`
+    );
     state.renderer.refresh();
   });
 
   state.renderer.on("leaveNode", () => {
     state.hoveredNode = null;
-    tt.hidden = true;
+    hideTooltipEl();
     state.renderer.refresh();
   });
 
-  container.addEventListener("mousemove", (e) => {
-    if (tt.hidden) return;
-    const pad = 14;
-    let x = e.clientX + pad;
-    let y = e.clientY + pad;
-    const r = tt.getBoundingClientRect();
-    if (x + r.width > window.innerWidth) x = e.clientX - r.width - pad;
-    if (y + r.height > window.innerHeight) y = e.clientY - r.height - pad;
-    tt.style.left = x + "px";
-    tt.style.top = y + "px";
-  });
+  container.addEventListener("mousemove", positionTooltipAt);
 }
 
 // ── Selection (click → draw incident edges + open detail) ────────────────
@@ -967,108 +1614,82 @@ function buildIntraTopicLayer() {
 }
 
 // ── Community integration (color mode + detail readout) ─────────────────────
-// For the dataset's Leiden citation-community grouping, measure how much each
-// community cites outside itself (citations treated as undirected):
-//   vol  = total citation degree (in+out) of the community's papers
-//   cut  = citations with exactly one endpoint in the community (its boundary)
-//   phi  = conductance = cut / min(vol, 2M-vol)        (low = isolated/insular)
-//   exp  = config-model expected conductance = (2M-vol)/2M   (~chance)
-//   Rext = phi / exp = outward connectivity vs chance  (1.0 = random)
-// Plus the partition's global modularity Q. O(nodes + edges); cached on state.
-// Coral (isolated) → slate → teal (integrated), diverging around the median phi.
+// For the dataset's Leiden citation-community grouping, how much each
+// community cites outside itself, at the currently selected resolution.
+// Sourced directly from community_quality_metrics.py's backend-computed,
+// DIRECTED, per-resolution metrics (conductance + its outward/inward
+// decomposition) via state.groupData.community[cid].quality and
+// state.resolutionMetrics -- no runtime graph traversal needed.
+// Coral (self-contained) → slate → teal (integrated), diverging around the
+// resolution's median conductance.
 const INTEG_RAMP = [[216, 90, 48], [90, 102, 122], [29, 158, 117]];
 
-function computeCommunityIntegration() {
-  state.communityIntegration = null;
-  const cg = citationGrouping();
-  if (!cg) return;
-  const field = cg.nodeField;
-  const data = cg.data;
-  const nodes = state.nodesData.nodes;
-  const n = nodes.length;
-  const out = state.outCSR, inn = state.inCSR;
-  const M = out.targets.length;       // total directed citations
-  const twoM = 2 * M;
-  const named = (cid) => data[String(cid)] != null;
+// The whole-graph metrics row for the currently selected resolution (from
+// resolution_metrics.json), or null if unavailable.
+function currentResolutionMetrics() {
+  const rm = state.resolutionMetrics;
+  if (!rm || state.communityResolution == null) return null;
+  return rm.resolutions.find((r) => String(r.resolution) === String(state.communityResolution)) || null;
+}
 
-  const vol = new Map(), cut = new Map(), internal = new Map();
-  const bump = (m, k) => m.set(k, (m.get(k) || 0) + 1);
-
-  for (let i = 0; i < n; i++) {
-    const c = nodes[i][field];
-    if (!named(c)) continue;
-    const deg = (out.offsets[i + 1] - out.offsets[i]) + (inn.offsets[i + 1] - inn.offsets[i]);
-    vol.set(c, (vol.get(c) || 0) + deg);
-  }
-  for (let i = 0; i < n; i++) {
-    const ci = nodes[i][field];
-    for (const t of csrNeighbors(out, i)) {
-      const ct = nodes[t][field];
-      if (ci === ct) {
-        if (named(ci)) bump(internal, ci);
-      } else {
-        if (named(ci)) bump(cut, ci);
-        if (named(ct)) bump(cut, ct);
-      }
-    }
-  }
-
-  const byId = {};
-  const phis = [];
-  let Q = 0, internalTotal = 0;
-  for (const cid of Object.keys(data)) {
-    const c = data[cid].id;
-    const v = vol.get(c) || 0, ct = cut.get(c) || 0, ic = internal.get(c) || 0;
-    const phi = ct / (Math.min(v, twoM - v) || 1);
-    const exp = twoM ? (twoM - v) / twoM : 1;
-    byId[c] = { phi, Rext: exp ? phi / exp : 0, cut: ct, vol: v, internal: ic };
-    if (v > 0) phis.push(phi);
-    Q += (M ? ic / M : 0) - Math.pow(v / (twoM || 1), 2);
-    internalTotal += ic;
-  }
-  phis.sort((a, b) => a - b);
-  const lo = phis[0] ?? 0, hi = phis[phis.length - 1] ?? 1;
-  const mid = phis.length ? phis[Math.floor(phis.length / 2)] : (lo + hi) / 2;
-  state.communityIntegration = { byId, lo, mid, hi, Q, internalShare: M ? internalTotal / M : 0 };
+// Conductance the diverging Integration scale is centered on. Deliberately the
+// median over SUBSTANTIVE communities: a median over all communities is 1.0 at
+// almost every resolution (a singleton's every incident edge is a boundary edge,
+// and singletons are the majority), which pinned the whole ramp to its coral
+// half and made every community report as "more self-contained than most".
+// The communities coloured on the map are the substantive ones anyway.
+function centerConductance(rm) {
+  return rm.conductance_median_over_substantive_communities
+    ?? rm.conductance_median_over_communities_with_at_least_2_nodes;
 }
 
 // Diverging color for a paper by its community's conductance, centered on the
-// field median so the map reads as relatively integrated (teal) vs separate (coral).
+// current resolution's median so the map reads as relatively self-contained
+// (coral) vs integrated (teal).
 function integrationColor(r) {
-  const ci = state.communityIntegration;
   const cg = citationGrouping();
-  if (!ci || !cg) return "#888";
-  const rec = ci.byId[r[cg.nodeField]];
-  if (!rec || rec.vol === 0) return "#3a4150"; // ungrouped / no citations
-  const { lo, mid, hi } = ci;
-  const t = rec.phi <= mid
-    ? (mid > lo ? 0.5 * (rec.phi - lo) / (mid - lo) : 0)
-    : (hi > mid ? 0.5 + 0.5 * (rec.phi - mid) / (hi - mid) : 1);
+  const rm = currentResolutionMetrics();
+  if (!cg || !rm) return "#888";
+  const entry = state.groupData.community[String(r[cg.nodeField])];
+  const q = entry && entry.quality;
+  if (!q) return "#3a4150"; // ungrouped, or too small/unnamed to have quality data
+  const mid = centerConductance(rm);
+  const t = q.conductance <= mid
+    ? (mid > 0 ? 0.5 * (q.conductance / mid) : 0)
+    : (mid < 1 ? 0.5 + 0.5 * (q.conductance - mid) / (1 - mid) : 1);
   return rampColor(INTEG_RAMP, clamp01(t));
 }
 
-// Detail-panel block for a citation community: its integration vs chance.
+// Detail-panel block for a citation community: its true (full-network),
+// directed conductance at the current resolution, vs the field as a whole.
 function integrationBlock(c) {
-  if (!state.communityIntegration) computeCommunityIntegration();
-  const ci = state.communityIntegration;
-  if (!ci) return "";
-  const rec = ci.byId[c.id];
-  if (!rec || rec.vol === 0) return "";
-  const ranked = Object.values(ci.byId).filter((x) => x.vol > 0).map((x) => x.Rext).sort((a, b) => b - a);
-  const rank = ranked.indexOf(rec.Rext) + 1;
-  const fold = rec.Rext > 0 ? 1 / rec.Rext : 0;
-  const verdict = rec.phi >= ci.mid ? "more integrated than most" : "more self-contained than most";
-  const pct = (x) => `${Math.round(x * 100)}%`;
+  const rm = currentResolutionMetrics();
+  const q = c.quality;
+  if (!q || !rm) return "";
+  const conductances = Object.values(state.groupData.community)
+    .map((x) => x.quality && x.quality.conductance)
+    .filter((x) => x != null)
+    .sort((a, b) => a - b);
+  const rank = conductances.indexOf(q.conductance) + 1;
+  const verdict = q.conductance <= centerConductance(rm) ? "more self-contained than most" : "more integrated than most";
+  const pct = (x) => `${Math.round((x || 0) * 100)}%`;
+  const trueSizeNote = c.true_size
+    ? ` (${c.true_size.toLocaleString()} papers in the full network; this map plots a subset)`
+    : "";
   return `
-    <h3 title="How much this community cites beyond itself, from the citation graph.">Integration</h3>
-    <p class="meta">This community is <strong>${verdict}</strong> — about
-       <strong>${fold.toFixed(1)}×</strong> more self-contained than a degree-matched
-       random graph (ranked #${rank} of ${ranked.length} by outward connectivity).</p>
+    <h3 title="How much this community cites beyond itself, from the directed citation graph, at the selected resolution.">Integration</h3>
+    <p class="meta">This community is <strong>${verdict}</strong> at resolution
+       ${escapeHtml(String(state.communityResolution))} (ranked #${rank} of ${conductances.length}
+       by conductance)${trueSizeNote}.</p>
     <div class="cmx-stats">
-      <span title="Conductance: share of this community's citation links that cross its boundary. Lower = more insular.">Conductance φ: <strong>${rec.phi.toFixed(2)}</strong></span>
-      <span title="Boundary citations relative to a degree-matched random graph. 1.0 = chance; below 1 = more self-contained than chance.">Outward vs chance: <strong>${rec.Rext.toFixed(2)}×</strong></span>
+      <span title="Conductance: share of this community's directed citation links crossing its boundary (min(volume, 2M-volume) normalization). Lower = more insular.">Conductance: <strong>${q.conductance.toFixed(2)}</strong></span>
+      <span title="Of this community's own outgoing citations, the share leaving the community (citing outside literature).">Cites out: <strong>${pct(q.conductance_out)}</strong></span>
+      <span title="Of citations landing on this community, the share arriving from outside it.">Cited from outside: <strong>${pct(q.conductance_in)}</strong></span>
+      <span title="Internal citation density: share of this community's own possible directed links that are realized.">Internal density: <strong>${(q.internal_edge_density * 100).toFixed(1)}%</strong></span>
     </div>
-    <p class="meta">Field-wide: modularity Q = <strong>${ci.Q.toFixed(2)}</strong>; ${pct(ci.internalShare)} of all citations stay within a community.</p>
+    <p class="meta">Field-wide at this resolution: modularity <strong>${rm.modularity.toFixed(2)}</strong>;
+       ${pct(rm.intra_community_edge_fraction)} of all citations stay within a community across
+       <strong>${rm.number_of_communities.toLocaleString()}</strong> communities.</p>
   `;
 }
 
@@ -1240,9 +1861,16 @@ function showGroupDetail(key, gid) {
   const authors = (c.top_authors || [])
     .map((a) => `<li>${escapeHtml(a.name)}<div class="sub">${a.papers ?? ""} papers</div></li>`)
     .join("");
-  const keywords = (c.top_keywords || [])
+  // Distinguishing keywords: bars from community_keywords.json when the dataset
+  // has them for this citation community (community_keywords.py's corrected
+  // TF-IDF, or the site's own -- see keywordItemsFor); else the legend's list.
+  const barItems = g.citation ? keywordItemsFor(state.communityResolution, gid) : null;
+  const keywords = barItems ? "" : (c.top_keywords || [])
     .map((k) => `<li>${escapeHtml(k.keyword)}<div class="sub">tf-idf ${k.tfidf?.toFixed(3) ?? ""}</div></li>`)
     .join("");
+  const keywordBarsBlock = barItems
+    ? `<h3>Distinguishing keywords</h3><div class="keyword-bars-wrap" id="detail-keyword-bars"></div>`
+    : "";
   const wordsBlock = c.top_words
     ? `<h3>Top words</h3><p class="meta">${escapeHtml(c.top_words)}</p>`
     : "";
@@ -1274,11 +1902,14 @@ function showGroupDetail(key, gid) {
     ${integBlock}
     ${metricsBlock}
     ${wordsBlock}
+    ${keywordBarsBlock}
     ${keywords ? `<h3>Top keywords</h3><ul class="top-list">${keywords}</ul>` : ""}
     ${authors ? `<h3>Top authors</h3><ul class="top-list">${authors}</ul>` : ""}
     ${papers ? `<h3>Top papers</h3><ul class="top-list">${papers}</ul>` : ""}
   `;
   document.getElementById("detail").hidden = false;
+  const barsEl = document.getElementById("detail-keyword-bars");
+  if (barsEl && barItems) renderKeywordBars(barsEl, { items: barItems, color: c.color, maxBars: 12 });
   document.getElementById("frame-group").addEventListener("click", () => frameGroup(key, gid));
   document.getElementById("isolate-group").addEventListener("click", () => toggleIsolateGroup(key, gid));
   document.getElementById("show-islands")?.addEventListener("click", () => highlightTopicIslands(key, gid));
@@ -1317,7 +1948,7 @@ function frameNode(idx) {
 function frameGroup(key, gid) {
   const g = grouping(key);
   const c = g.data[gid];
-  const cen = groupCentroid(key, gid) || c.centroid;
+  const cen = groupCentroid(key, gid) || orient(c.centroid[0], c.centroid[1]);
   const cx = cen[0],
     cy = cen[1];
   let bestIdx = -1;
@@ -1406,7 +2037,6 @@ function isolateGroup(key, gid) {
 function initControls() {
   document.getElementById("color-by").addEventListener("change", (e) => {
     state.colorBy = e.target.value;
-    if (state.colorBy === "integration" && !state.communityIntegration) computeCommunityIntegration();
     renderGroupLabels();
     state.renderer.refresh();
   });
@@ -1451,7 +2081,7 @@ function buildColorByOptions() {
   const sel = document.getElementById("color-by");
   const opts = activeGroupings().map((g) => ({ value: g.key, label: g.label }));
   opts.push({ value: "year", label: "Year" }, { value: "indegree", label: "Citations" });
-  if (citationGrouping()) opts.push({ value: "integration", label: "Integration" });
+  if (citationGrouping() && state.resolutionMetrics) opts.push({ value: "integration", label: "Integration" });
   sel.innerHTML = opts
     .map((o) => `<option value="${o.value}">${escapeHtml(o.label)}</option>`)
     .join("");
@@ -1567,6 +2197,12 @@ function buildLegend(key) {
   const ul = state.legendEls[key];
   ul.innerHTML = "";
 
+  // Idempotent: buildLegend can now be re-invoked on the same grouping (e.g.
+  // applyCommunityResolution() rebuilding "community" on every resolution
+  // switch), so drop any button row from a previous call before adding a new one.
+  const prevBtnRow = ul.previousElementSibling;
+  if (prevBtnRow && prevBtnRow.classList.contains("legend-btn-row")) prevBtnRow.remove();
+
   const btnRow = document.createElement("div");
   btnRow.className = "legend-btn-row";
   btnRow.innerHTML = `
@@ -1643,15 +2279,28 @@ function refreshLegend(key) {
   }
 }
 
-// ── Tabs (Graph/Table) ───────────────────────────────────────────────────
+// ── Tabs (Graph/Metrics/Table) ───────────────────────────────────────────
 function initTabs() {
-  const tabGraph = document.getElementById("tab-graph");
-  const viewGraph = document.getElementById("view-graph");
-  tabGraph.addEventListener("click", () => {
-    tabGraph.classList.add("active");
-    viewGraph.classList.add("active");
-    state.renderer.refresh();
-  });
+  // Local (not module-level): main() calls initTabs() synchronously at boot,
+  // before the module has finished its top-to-bottom evaluation, so a
+  // module-level `const` positioned later in the file would still be in its
+  // temporal dead zone at that point.
+  const TABS = [
+    { tabId: "tab-graph", viewId: "view-graph" },
+    { tabId: "tab-metrics", viewId: "view-metrics" },
+    { tabId: "tab-figures", viewId: "view-figures" },
+  ];
+  for (const { tabId, viewId } of TABS) {
+    const tabEl = document.getElementById(tabId);
+    if (!tabEl) continue;
+    tabEl.addEventListener("click", () => {
+      for (const other of TABS) {
+        document.getElementById(other.tabId)?.classList.toggle("active", other.tabId === tabId);
+        document.getElementById(other.viewId)?.classList.toggle("active", other.viewId === viewId);
+      }
+      if (tabId === "tab-graph" && state.renderer) state.renderer.refresh();
+    });
+  }
 }
 
 function initControlsToggle() {
@@ -1744,7 +2393,7 @@ async function applyGlobalFilters() {
     const r = nodes[i];
     if (state.snapshot && !state.snapshot.visible.has(String(i))) continue;
     if (r.year != null && (r.year < lo || r.year > hi)) continue;
-    if (nodeHiddenByMute(r)) continue;
+    if (nodeHiddenByMute(r) || removedByModifier(i)) continue;
     if (qTitle && !idx.title[i].includes(qTitle)) continue;
     if (qJournal && !idx.journal[i].includes(qJournal)) continue;
     if (authorQs.length && !matchesAll(idx.authors[i], authorQs)) continue;
@@ -1780,7 +2429,7 @@ function updateSelectedCount() {
       const r = nodes[i];
       if (state.snapshot && !state.snapshot.visible.has(String(i))) continue;
       if (r.year != null && (r.year < state.yearMin || r.year > state.yearMax)) continue;
-      if (nodeHiddenByMute(r)) continue;
+      if (nodeHiddenByMute(r) || removedByModifier(i)) continue;
       c++;
     }
     el.textContent = `Nodes selected: ${c.toLocaleString()}`;
@@ -1803,7 +2452,7 @@ function initShiftTracking() {
 function loadAbstract(nodeId) {
   if (state.abstracts) return Promise.resolve(state.abstracts[nodeId] || "");
   if (!state.abstractsPromise) {
-    state.abstractsPromise = fetch(`${DATASETS[state.dataset].dir}/abstracts.json`)
+    state.abstractsPromise = fetch(`${sharedDir(DATASETS[state.dataset])}/abstracts.json`)
       .then((r) => r.json())
       .then((obj) => {
         state.abstracts = obj;
@@ -1811,6 +2460,1165 @@ function loadAbstract(nodeId) {
       });
   }
   return state.abstractsPromise.then((obj) => obj[nodeId] || "");
+}
+
+// ── Resolution-metrics charts (Metrics tab, small multiples) ────────────────
+// Hand-rolled inline-SVG line charts (no charting library): one small chart
+// per whole-graph metric, all sharing the resolution x-axis, each with its own
+// auto-scaled y-axis (never a shared/dual axis -- these metrics have wildly
+// different scales and units). A crosshair + the app's existing tooltip give
+// exact per-resolution values on hover; clicking a point recolors the map by
+// that resolution's communities (applyCommunityResolution).
+const CHART_W = 300, CHART_H = 172;
+const CHART_PAD = { l: 46, r: 12, t: 12, b: 42 };
+
+function svgEl(tag, attrs) {
+  const el = document.createElementNS("http://www.w3.org/2000/svg", tag);
+  for (const k in attrs) el.setAttribute(k, attrs[k]);
+  return el;
+}
+
+// Compact axis-tick numbers so wide values (counts, the Potts score, surprise)
+// fit the y-axis gutter: 1,949 -> "1.9k", 345,327 -> "345k". Small values fall
+// back to the chart's own formatter (which carries units like % / decimals).
+function compactNumber(y) {
+  const a = Math.abs(y);
+  if (a >= 1e6) return (y / 1e6).toFixed(a >= 1e7 ? 0 : 1).replace(/\.0$/, "") + "M";
+  if (a >= 1e4) return Math.round(y / 1e3) + "k";
+  if (a >= 1e3) return (y / 1e3).toFixed(1).replace(/\.0$/, "") + "k";
+  return null;
+}
+
+// points: [{x: "<resolution>", y: number|null}, ...] in resolution order.
+// `unit` labels the y-axis (rotated); the x-axis is always the CPM resolution.
+function renderLineChart(container, opts) {
+  const { title, hint, unit, points, pointsAfter, legend, format, thresholdY, bands, band, onPointClick } = opts;
+  const xs = points.map((p) => p.x);
+  const ys = points.map((p) => p.y).filter((y) => y != null);
+  if (!ys.length) return;
+  // A percentile ribbon has to be inside the y range or it clips.
+  const bandValues = (band || [])
+    .flatMap((b) => [b.lo, b.hi])
+    .filter((v) => v != null);
+  // An optional "after CM" second series shares the x axis and must be inside the
+  // y range too, so both lines are visible at the same scale.
+  const ysAfter = (pointsAfter || []).map((p) => p.y).filter((y) => y != null);
+  const yMin0 = Math.min(...ys, ...ysAfter, ...bandValues), yMax0 = Math.max(...ys, ...ysAfter, ...bandValues);
+  const span = yMax0 - yMin0 || Math.abs(yMax0) || 1;
+  const yMin = yMin0 - span * 0.12, yMax = yMax0 + span * 0.12;
+  const tickFormat = (y) => compactNumber(y) ?? format(y);
+
+  const plotW = CHART_W - CHART_PAD.l - CHART_PAD.r;
+  const plotH = CHART_H - CHART_PAD.t - CHART_PAD.b;
+  const xAt = (i) => CHART_PAD.l + (xs.length > 1 ? (i / (xs.length - 1)) * plotW : plotW / 2);
+  const yAt = (y) => CHART_PAD.t + plotH - ((y - yMin) / (yMax - yMin)) * plotH;
+  const axisBottom = CHART_PAD.t + plotH;
+
+  const wrap = document.createElement("div");
+  wrap.className = "metric-tile";
+  const head = document.createElement("div");
+  head.className = "metric-tile-title";
+  head.textContent = title;
+  wrap.appendChild(head);
+  if (hint) {
+    const p = document.createElement("div");
+    p.className = "metric-tile-hint";
+    p.textContent = hint;
+    wrap.appendChild(p);
+  }
+
+  const svg = svgEl("svg", { viewBox: `0 0 ${CHART_W} ${CHART_H}`, class: "metric-chart" });
+
+  for (const b of bands || []) {
+    svg.appendChild(svgEl("rect", {
+      x: xAt(b.i0) - 5, y: CHART_PAD.t, width: xAt(b.i1) - xAt(b.i0) + 10, height: plotH,
+      class: "metric-band",
+    }));
+  }
+
+  // ── Y axis: min/mid/max ticks (gridline + value label) + a rotated unit title.
+  const yTicks = [...new Set([yMax0, (yMin0 + yMax0) / 2, yMin0])];
+  for (const ty of yTicks) {
+    const y = yAt(ty);
+    svg.appendChild(svgEl("line", { x1: CHART_PAD.l, y1: y, x2: CHART_PAD.l + plotW, y2: y, class: "metric-gridline" }));
+    const lab = svgEl("text", { x: CHART_PAD.l - 5, y: y + 3, class: "metric-tick", "text-anchor": "end" });
+    lab.textContent = tickFormat(ty);
+    svg.appendChild(lab);
+  }
+  svg.appendChild(svgEl("line", { x1: CHART_PAD.l, y1: CHART_PAD.t, x2: CHART_PAD.l, y2: axisBottom, class: "metric-axis" }));
+  if (unit) {
+    const yTitle = svgEl("text", {
+      x: 11, y: CHART_PAD.t + plotH / 2, class: "metric-axis-title",
+      "text-anchor": "middle", transform: `rotate(-90 11 ${CHART_PAD.t + plotH / 2})`,
+    });
+    yTitle.textContent = unit;
+    svg.appendChild(yTitle);
+  }
+
+  // ── X axis: baseline, a tick per resolution, ~5 value labels, and a title.
+  svg.appendChild(svgEl("line", { x1: CHART_PAD.l, y1: axisBottom, x2: CHART_PAD.l + plotW, y2: axisBottom, class: "metric-axis" }));
+  const labelStep = Math.max(1, Math.ceil(xs.length / 5));
+  xs.forEach((xv, i) => {
+    svg.appendChild(svgEl("line", { x1: xAt(i), y1: axisBottom, x2: xAt(i), y2: axisBottom + 3, class: "metric-axis" }));
+    if (i % labelStep === 0 || i === xs.length - 1) {
+      const lab = svgEl("text", { x: xAt(i), y: axisBottom + 13, class: "metric-tick", "text-anchor": "middle" });
+      lab.textContent = xv;
+      svg.appendChild(lab);
+    }
+  });
+  const xTitle = svgEl("text", { x: CHART_PAD.l + plotW / 2, y: CHART_H - 3, class: "metric-axis-title", "text-anchor": "middle" });
+  xTitle.textContent = "Resolution";
+  svg.appendChild(xTitle);
+
+  if (thresholdY != null) {
+    const ty = yAt(thresholdY);
+    svg.appendChild(svgEl("line", { x1: CHART_PAD.l, y1: ty, x2: CHART_PAD.l + plotW, y2: ty, class: "metric-threshold" }));
+  }
+
+  // Percentile ribbon behind the median line (drawn first so the line wins).
+  if (band && bandValues.length) {
+    const upper = [], lower = [];
+    band.forEach((b, i) => {
+      if (b.lo == null || b.hi == null) return;
+      upper.push(`${xAt(i).toFixed(1)},${yAt(b.hi).toFixed(1)}`);
+      lower.unshift(`${xAt(i).toFixed(1)},${yAt(b.lo).toFixed(1)}`);
+    });
+    if (upper.length) {
+      svg.appendChild(svgEl("path", {
+        d: `M${upper.join("L")}L${lower.join("L")}Z`, class: "metric-ribbon",
+      }));
+    }
+  }
+
+  let d = "";
+  points.forEach((p, i) => {
+    if (p.y == null) return;
+    d += (d ? "L" : "M") + xAt(i).toFixed(1) + "," + yAt(p.y).toFixed(1) + " ";
+  });
+  svg.appendChild(svgEl("path", { d, class: "metric-line" }));
+
+  points.forEach((p, i) => {
+    if (p.y == null) return;
+    svg.appendChild(svgEl("circle", { cx: xAt(i), cy: yAt(p.y), r: 2.4, class: "metric-dot" }));
+  });
+
+  // Optional "after CM" second series: a dashed line in a contrasting hue (identity
+  // by dash AND colour, never colour alone) sharing this chart's x/y mapping.
+  if (pointsAfter) {
+    let dAfter = "";
+    pointsAfter.forEach((p, i) => {
+      if (p.y == null) return;
+      dAfter += (dAfter ? "L" : "M") + xAt(i).toFixed(1) + "," + yAt(p.y).toFixed(1) + " ";
+    });
+    svg.appendChild(svgEl("path", { d: dAfter, class: "metric-line metric-line-after" }));
+    pointsAfter.forEach((p, i) => {
+      if (p.y == null) return;
+      svg.appendChild(svgEl("circle", { cx: xAt(i), cy: yAt(p.y), r: 2.4, class: "metric-dot metric-dot-after" }));
+    });
+  }
+
+  // Crosshair + hover/click capture.
+  const crosshair = svgEl("line", {
+    x1: 0, y1: CHART_PAD.t, x2: 0, y2: CHART_PAD.t + plotH, class: "metric-crosshair",
+  });
+  crosshair.style.visibility = "hidden";
+  svg.appendChild(crosshair);
+
+  const capture = svgEl("rect", { x: 0, y: 0, width: CHART_W, height: CHART_H, class: "metric-capture" });
+  svg.appendChild(capture);
+
+  function nearestIndex(evt) {
+    const rect = svg.getBoundingClientRect();
+    const relX = ((evt.clientX - rect.left) / rect.width) * CHART_W;
+    const idx = Math.round(((relX - CHART_PAD.l) / plotW) * (xs.length - 1));
+    return Math.max(0, Math.min(xs.length - 1, idx));
+  }
+
+  capture.addEventListener("mousemove", (evt) => {
+    const idx = nearestIndex(evt);
+    crosshair.setAttribute("x1", xAt(idx));
+    crosshair.setAttribute("x2", xAt(idx));
+    crosshair.style.visibility = "visible";
+    const p = points[idx];
+    const pa = pointsAfter && pointsAfter[idx];
+    const b = band && band[idx];
+    const valueLines = pointsAfter
+      ? `<div class="tt-meta">Before CM: ${p.y != null ? format(p.y) : "n/a"}</div>` +
+        `<div class="tt-meta">After CM: ${pa && pa.y != null ? format(pa.y) : "n/a"}</div>`
+      : `<div class="tt-meta">${escapeHtml(title)}: ${p.y != null ? format(p.y) : "n/a"}</div>`;
+    showTooltip(
+      `<strong>Resolution ${escapeHtml(xs[idx])}</strong>` +
+      valueLines +
+      (b && b.lo != null && b.hi != null
+        ? `<div class="tt-meta">25th–75th percentile: ${format(b.lo)} – ${format(b.hi)}</div>` : "")
+    );
+    positionTooltipAt(evt);
+  });
+  capture.addEventListener("mouseleave", () => {
+    crosshair.style.visibility = "hidden";
+    hideTooltipEl();
+  });
+  if (onPointClick) {
+    capture.style.cursor = "pointer";
+    capture.addEventListener("click", (evt) => onPointClick(xs[nearestIndex(evt)]));
+  }
+
+  wrap.appendChild(svg);
+  if (legend && legend.length) {
+    const leg = document.createElement("div");
+    leg.className = "metric-band-legend";
+    leg.innerHTML = legend.map((item) =>
+      `<span class="mbl-item"><i style="background:${item.color}"></i>${escapeHtml(item.label)}</span>`).join("");
+    wrap.appendChild(leg);
+  }
+  container.appendChild(wrap);
+}
+
+// Clicking any chart point recolors the map by that resolution's communities
+// (switching "Color by" to Community/Integration if it isn't already one of
+// those, so the effect is immediately visible).
+function onResolutionPointClick(resolution) {
+  applyCommunityResolution(resolution);
+  if (state.colorBy !== "community" && state.colorBy !== "integration") {
+    state.colorBy = "community";
+    const sel = document.getElementById("color-by");
+    if (sel) sel.value = "community";
+    renderGroupLabels();
+    state.renderer.refresh();
+  }
+}
+
+function renderResolutionMetricsPanel() {
+  const grid = document.getElementById("metrics-grid");
+  if (!grid || !state.resolutionMetrics) return;
+  grid.innerHTML = "";
+
+  const rows = state.resolutionMetrics.resolutions; // already sorted by resolution
+  const xs = rows.map((r) => String(r.resolution));
+  const series = (field) => rows.map((r, i) => ({ x: xs[i], y: r[field] }));
+
+  // Optional "after CM" overlay: the same whole-graph metrics scored on the
+  // Connectivity-Modifier-remediated partition, matched to each resolution key so
+  // it stays aligned with the before series' x axis.
+  const afterRows = state.resolutionMetricsAfterCm && state.resolutionMetricsAfterCm.resolutions;
+  const afterByRes = afterRows ? new Map(afterRows.map((r) => [String(r.resolution), r])) : null;
+  const seriesAfter = (field) =>
+    afterByRes ? xs.map((x) => ({ x, y: afterByRes.get(x) ? (afterByRes.get(x)[field] ?? null) : null })) : undefined;
+  const beforeAfterLegend = afterByRes
+    ? [{ label: "Before CM", color: "var(--accent)" }, { label: "After CM", color: "var(--accent-after)" }]
+    : undefined;
+
+  const pct = (y) => `${Math.round(y * 100)}%`;
+  const num = (y) => y.toLocaleString(undefined, { maximumFractionDigits: 2 });
+  const count = (y) => Math.round(y).toLocaleString();
+
+  // Contiguous runs of is_on_resolution_plateau, as [firstIdx, lastIdx] bands.
+  const plateauBands = [];
+  let start = null;
+  rows.forEach((r, i) => {
+    if (r.is_on_resolution_plateau && start === null) start = i;
+    if (!r.is_on_resolution_plateau && start !== null) { plateauBands.push({ i0: start, i1: i - 1 }); start = null; }
+  });
+  if (start !== null) plateauBands.push({ i0: start, i1: rows.length - 1 });
+
+  renderLineChart(grid, {
+    title: "Communities found", hint: "Number of Leiden/CPM communities detected (the after-CM structure is in the well-connectedness panels below)",
+    unit: "communities", points: series("number_of_communities"), format: count, onPointClick: onResolutionPointClick,
+  });
+  renderLineChart(grid, {
+    title: "Modularity", hint: "Newman–Girvan modularity of the partition",
+    unit: "modularity (unitless)", points: series("modularity"), pointsAfter: seriesAfter("modularity"),
+    legend: beforeAfterLegend, format: num, onPointClick: onResolutionPointClick,
+  });
+  renderLineChart(grid, {
+    title: "Constant Potts model score", hint: "The objective Leiden actually optimizes here",
+    unit: "score (unitless)", points: series("constant_potts_model_score"),
+    pointsAfter: seriesAfter("constant_potts_model_score"), legend: beforeAfterLegend,
+    format: num, onPointClick: onResolutionPointClick,
+  });
+  renderLineChart(grid, {
+    title: "Coverage", hint: "Share of all citations that stay within a community",
+    unit: "% of all citations", points: series("intra_community_edge_fraction"),
+    pointsAfter: seriesAfter("intra_community_edge_fraction"), legend: beforeAfterLegend,
+    format: pct, onPointClick: onResolutionPointClick,
+  });
+  renderLineChart(grid, {
+    title: "Surprise", hint: "How unlikely this partition's density is under a random null (higher = less likely by chance)",
+    unit: "surprise (nats)", points: series("surprise"), pointsAfter: seriesAfter("surprise"),
+    legend: beforeAfterLegend, format: num, onPointClick: onResolutionPointClick,
+  });
+  renderLineChart(grid, {
+    title: "Significance", hint: "Density excess vs. a random graph, summed over communities (undirected only)",
+    unit: "significance (nats)", points: series("significance"), pointsAfter: seriesAfter("significance"),
+    legend: beforeAfterLegend, format: num, onPointClick: onResolutionPointClick,
+  });
+  renderLineChart(grid, {
+    title: "Adjacent-resolution stability", hint: "NMI between each resolution and the next — shaded = a stable plateau",
+    unit: "NMI (0–1)", points: rows.map((r, i) => ({ x: xs[i], y: r.resolution_plateau_nmi_with_next })),
+    format: num, thresholdY: 0.9, bands: plateauBands, onPointClick: onResolutionPointClick,
+  });
+  renderLineChart(grid, {
+    title: "Cross-seed NMI", hint: "Agreement with 5 Leiden re-runs at other random seeds (1.0 = perfectly reproducible)",
+    unit: "NMI (0–1)", points: series("cross_seed_normalized_mutual_information"), format: num, onPointClick: onResolutionPointClick,
+  });
+  renderLineChart(grid, {
+    title: "Cross-seed variation of information", hint: "Distance from those re-runs, in nats (lower = more reproducible)",
+    unit: "distance (nats)", points: series("cross_seed_variation_of_information"), format: num, onPointClick: onResolutionPointClick,
+  });
+
+  renderConnectivityPanels();
+}
+
+// ── Well-connectedness diagnostic + Connectivity Modifier before/after ────────
+// Driven by connectivity_metrics.json (community_connectivity_metrics.py +
+// community_connectivity_modifier.py). The section stays hidden if that file is
+// absent, so datasets without the connectivity DAGs are unaffected.
+function renderConnectivityPanels() {
+  const section = document.getElementById("view-connectivity-section");
+  const grid = document.getElementById("connectivity-grid");
+  const cm = state.connectivityMetrics;
+  if (!section || !grid || !cm || !cm.resolutions || !cm.resolutions.length) return;
+  grid.innerHTML = "";
+  section.hidden = false;
+
+  const rows = cm.resolutions.slice().sort((a, b) => a.resolution - b.resolution);
+  const xs = rows.map((r) => String(r.resolution));
+  const series = (field) => rows.map((r, i) => ({ x: xs[i], y: r[field] }));
+  const constant = (v) => xs.map((x) => ({ x, y: v }));
+  const beforeAfterLegend = [
+    { label: "Before CM", color: "var(--accent)" }, { label: "After CM", color: "var(--accent-after)" }];
+
+  const pct = (y) => `${Math.round(y * 100)}%`;
+  const num = (y) => y.toLocaleString(undefined, { maximumFractionDigits: 2 });
+
+  // Well-connected % of substantive communities (diagnostic on the original
+  // partition) vs. after CM, which is 100% by construction — a validation line.
+  renderLineChart(grid, {
+    title: "Well-connected communities",
+    hint: "Share of substantive communities whose minimum edge cut exceeds log10(n). After CM this is 100% by construction.",
+    unit: "% of substantive", points: series("fraction_well_connected_over_substantive_communities"),
+    pointsAfter: constant(1), legend: beforeAfterLegend, format: pct, onPointClick: onResolutionPointClick,
+  });
+
+  // Node coverage: share of papers in a kept community, before vs. after CM.
+  renderLineChart(grid, {
+    title: "Node coverage",
+    hint: "Share of papers in a kept community (size ≥ 11). CM trims weakly-attached papers, so coverage falls — the cost of remediation.",
+    unit: "% of papers", points: series("node_coverage_before_in_communities_at_least_min_size"),
+    pointsAfter: series("node_coverage_after"), legend: beforeAfterLegend, format: pct, onPointClick: onResolutionPointClick,
+  });
+
+  // Median minimum edge cut of substantive communities.
+  renderLineChart(grid, {
+    title: "Median minimum edge cut",
+    hint: "Median minimum edge cut of substantive communities — how many citations must be cut to split the typical one.",
+    unit: "edges", points: series("median_minimum_edge_cut_size_over_substantive_communities"),
+    format: num, onPointClick: onResolutionPointClick,
+  });
+
+  // How CM transformed each substantive community (the Fig. 3 taxonomy).
+  const taxonomyBands = [
+    { label: "Extant", color: "#4a9d7f" },
+    { label: "Reduced", color: "#e0a34b" },
+    { label: "Split", color: "#7c74d6" },
+    { label: "Degraded", color: "#8a94a6" },
+  ];
+  const taxonomyRows = rows.map((r) => ({
+    resolution: String(r.resolution),
+    counts: [
+      r.number_of_substantive_communities_extant, r.number_of_substantive_communities_reduced,
+      r.number_of_substantive_communities_split, r.number_of_substantive_communities_degraded,
+    ],
+    total: r.number_of_original_substantive_communities,
+  }));
+  renderStackedBars(grid, {
+    title: "What CM did to each community",
+    hint: "Substantive communities by transformation: extant (unchanged), reduced (trimmed), split (≥2 well-connected pieces), degraded (dissolved below the size floor).",
+    rows: taxonomyRows, bands: taxonomyBands, onBarClick: onResolutionPointClick,
+  });
+}
+
+// ── Per-community health: real communities or artifacts? ──────────────────
+// Most "communities" Leiden reports are singletons or 2-3 paper fragments, and
+// no descriptive metric flags them: a 2-paper mutually-citing clique has
+// internal edge density 1.0, which looks perfect. These views separate the
+// artifact mass from the real structure, using the size-aware
+// internal_edge_surprise score plus size composition.
+//
+// Size bands are ORDERED, so they take a sequential single-hue ramp (dim ->
+// bright on this dark surface), not categorical hues. Validated for lightness
+// monotonicity and >= 3:1 contrast against the panel surface.
+const SUBSTANTIVE_MIN_SIZE = 30;
+const SIZE_BANDS = [
+  { key: "singleton", label: "Singleton (1 paper)", color: "#586b92" },
+  { key: "tiny", label: "Tiny (2–3)", color: "#4a7cc0" },
+  { key: "small", label: "Small (4–29)", color: "#5aa2e8" },
+  { key: "substantive", label: `Substantive (${SUBSTANTIVE_MIN_SIZE}+)`, color: "#96d3ff" },
+];
+
+function sizeBandIndex(size) {
+  if (size <= 1) return 0;
+  if (size <= 3) return 1;
+  if (size < SUBSTANTIVE_MIN_SIZE) return 2;
+  return 3;
+}
+
+const HEALTH_METRICS = {
+  internal_edge_surprise: {
+    label: "Internal edge surprise",
+    unit: "surprise (nats)",
+    hint: "How unlikely this community's internal citations are by chance. Size-aware: a 2-paper clique scores ~7 even at density 1.0.",
+    format: (y) => y.toLocaleString(undefined, { maximumFractionDigits: 1 }),
+    logY: true,
+  },
+  internal_edge_density: {
+    label: "Internal edge density",
+    unit: "density (0–1)",
+    hint: "Internal citations over possible ordered pairs. Misleadingly perfect for tiny communities.",
+    format: (y) => y.toFixed(3),
+    logY: false,
+  },
+  conductance: {
+    label: "Conductance",
+    unit: "conductance (0–1)",
+    hint: "Share of the community's citation links that cross its boundary. Lower = more insular. Exactly 1.0 for every singleton.",
+    format: (y) => y.toFixed(3),
+    logY: false,
+  },
+};
+
+// The distribution arrays for the active resolution, as an array of per-community
+// objects (small enough at ~2.5k communities to materialize on each render).
+function currentDistribution() {
+  const cd = state.communityDistributions;
+  if (!cd || state.communityResolution == null) return null;
+  const d = cd.by_resolution[String(state.communityResolution)];
+  if (!d) return null;
+  return d.community_size.map((size, i) => ({
+    community_id: d.community_id[i],
+    community_size: size,
+    conductance: d.conductance[i],
+    internal_edge_density: d.internal_edge_density[i],
+    internal_edge_surprise: d.internal_edge_surprise[i],
+  }));
+}
+
+function percentileOfSorted(sorted, p) {
+  if (!sorted.length) return null;
+  const idx = (sorted.length - 1) * p;
+  const lo = Math.floor(idx), hi = Math.ceil(idx);
+  return lo === hi ? sorted[lo] : sorted[lo] + (sorted[hi] - sorted[lo]) * (idx - lo);
+}
+
+// ── Composition: how much of each partition is artifact? ──────────────────
+// Stacked bar per resolution, segments in fixed band order, 2px surface gaps.
+function renderStackedBars(container, opts) {
+  const { title, hint, rows, onBarClick } = opts;
+  // Segments default to the community size bands, but any {label,color} list works
+  // (e.g. the Connectivity Modifier's extant/reduced/split/degraded taxonomy).
+  const bands = opts.bands || SIZE_BANDS;
+  const W = 300, H = 200, PAD = { l: 46, r: 12, t: 12, b: 42 };
+  const plotW = W - PAD.l - PAD.r, plotH = H - PAD.t - PAD.b;
+
+  const wrap = document.createElement("div");
+  wrap.className = "metric-tile metric-tile-wide";
+  const head = document.createElement("div");
+  head.className = "metric-tile-title";
+  head.textContent = title;
+  wrap.appendChild(head);
+  if (hint) {
+    const p = document.createElement("div");
+    p.className = "metric-tile-hint";
+    p.textContent = hint;
+    wrap.appendChild(p);
+  }
+
+  const svg = svgEl("svg", { viewBox: `0 0 ${W} ${H}`, class: "metric-chart" });
+  const maxTotal = Math.max(...rows.map((r) => r.total));
+  const yAt = (v) => PAD.t + plotH - (v / maxTotal) * plotH;
+  const bandW = plotW / rows.length;
+  const barW = Math.min(26, bandW * 0.62);
+
+  // Y axis: 0 / mid / max communities.
+  for (const tv of [maxTotal, maxTotal / 2, 0]) {
+    const y = yAt(tv);
+    svg.appendChild(svgEl("line", { x1: PAD.l, y1: y, x2: PAD.l + plotW, y2: y, class: "metric-gridline" }));
+    const lab = svgEl("text", { x: PAD.l - 5, y: y + 3, class: "metric-tick", "text-anchor": "end" });
+    lab.textContent = compactNumber(tv) ?? String(Math.round(tv));
+    svg.appendChild(lab);
+  }
+  const yTitle = svgEl("text", {
+    x: 11, y: PAD.t + plotH / 2, class: "metric-axis-title",
+    "text-anchor": "middle", transform: `rotate(-90 11 ${PAD.t + plotH / 2})`,
+  });
+  yTitle.textContent = "communities";
+  svg.appendChild(yTitle);
+  svg.appendChild(svgEl("line", { x1: PAD.l, y1: PAD.t + plotH, x2: PAD.l + plotW, y2: PAD.t + plotH, class: "metric-axis" }));
+
+  const labelStep = Math.max(1, Math.ceil(rows.length / 5));
+  rows.forEach((row, i) => {
+    const cx = PAD.l + bandW * (i + 0.5);
+    let cursor = 0;
+    bands.forEach((band, b) => {
+      const count = row.counts[b];
+      if (!count) return;
+      const y0 = yAt(cursor), y1 = yAt(cursor + count);
+      // 2px surface gap between stacked segments (skill: spacers), never
+      // shrinking a segment out of existence.
+      const h = Math.max(1, y0 - y1 - (cursor > 0 ? 2 : 0));
+      const rect = svgEl("rect", {
+        x: cx - barW / 2, y: y1, width: barW, height: h, rx: 1,
+        fill: band.color, class: "metric-bar-seg",
+      });
+      rect.addEventListener("mouseenter", () => showTooltip(
+        `<strong>Resolution ${escapeHtml(row.resolution)}</strong>` +
+        `<div class="tt-meta">${escapeHtml(band.label)}: ${count.toLocaleString()} of ` +
+        `${row.total.toLocaleString()} communities (${(100 * count / row.total).toFixed(1)}%)</div>` +
+        (row.nodeShares ? `<div class="tt-meta">holding ${row.nodeShares[b].toFixed(1)}% of papers</div>` : "")));
+      rect.addEventListener("mousemove", positionTooltipAt);
+      rect.addEventListener("mouseleave", hideTooltipEl);
+      if (onBarClick) {
+        rect.style.cursor = "pointer";
+        rect.addEventListener("click", () => onBarClick(row.resolution));
+      }
+      svg.appendChild(rect);
+      cursor += count;
+    });
+    if (i % labelStep === 0 || i === rows.length - 1) {
+      const lab = svgEl("text", { x: cx, y: PAD.t + plotH + 13, class: "metric-tick", "text-anchor": "middle" });
+      lab.textContent = row.resolution;
+      svg.appendChild(lab);
+    }
+  });
+  const xTitle = svgEl("text", { x: PAD.l + plotW / 2, y: H - 3, class: "metric-axis-title", "text-anchor": "middle" });
+  xTitle.textContent = "Resolution";
+  svg.appendChild(xTitle);
+  wrap.appendChild(svg);
+
+  // Legend: identity is never colour-alone.
+  const legend = document.createElement("div");
+  legend.className = "metric-band-legend";
+  legend.innerHTML = bands.map((b) =>
+    `<span class="mbl-item"><i style="background:${b.color}"></i>${escapeHtml(b.label)}</span>`).join("");
+  wrap.appendChild(legend);
+  container.appendChild(wrap);
+}
+
+// ── Histogram of one metric at the selected resolution ────────────────────
+function renderHistogram(container, opts) {
+  const { title, hint, values, unit, format, excludedNote } = opts;
+  const W = 300, H = 190, PAD = { l: 46, r: 12, t: 12, b: 42 };
+  const plotW = W - PAD.l - PAD.r, plotH = H - PAD.t - PAD.b;
+  if (!values.length) return;
+
+  const lo = Math.min(...values), hi = Math.max(...values);
+  const nBins = 24;
+  const span = hi - lo || 1;
+  const counts = new Array(nBins).fill(0);
+  for (const v of values) {
+    counts[Math.min(nBins - 1, Math.floor(((v - lo) / span) * nBins))] += 1;
+  }
+  const maxCount = Math.max(...counts);
+
+  const wrap = document.createElement("div");
+  wrap.className = "metric-tile";
+  const head = document.createElement("div");
+  head.className = "metric-tile-title";
+  head.textContent = title;
+  wrap.appendChild(head);
+  if (hint) {
+    const p = document.createElement("div");
+    p.className = "metric-tile-hint";
+    p.textContent = hint;
+    wrap.appendChild(p);
+  }
+
+  const svg = svgEl("svg", { viewBox: `0 0 ${W} ${H}`, class: "metric-chart" });
+  const yAt = (c) => PAD.t + plotH - (c / maxCount) * plotH;
+  for (const tv of [maxCount, maxCount / 2, 0]) {
+    const y = yAt(tv);
+    svg.appendChild(svgEl("line", { x1: PAD.l, y1: y, x2: PAD.l + plotW, y2: y, class: "metric-gridline" }));
+    const lab = svgEl("text", { x: PAD.l - 5, y: y + 3, class: "metric-tick", "text-anchor": "end" });
+    lab.textContent = compactNumber(tv) ?? String(Math.round(tv));
+    svg.appendChild(lab);
+  }
+  const yTitle = svgEl("text", {
+    x: 11, y: PAD.t + plotH / 2, class: "metric-axis-title",
+    "text-anchor": "middle", transform: `rotate(-90 11 ${PAD.t + plotH / 2})`,
+  });
+  yTitle.textContent = "communities";
+  svg.appendChild(yTitle);
+
+  const barW = plotW / nBins;
+  counts.forEach((c, i) => {
+    if (!c) return;
+    const y = yAt(c);
+    const rect = svgEl("rect", {
+      x: PAD.l + i * barW + 1, y, width: Math.max(1, barW - 2),
+      height: PAD.t + plotH - y, rx: 1, class: "metric-hist-bar",
+    });
+    const binLo = lo + (i / nBins) * span, binHi = lo + ((i + 1) / nBins) * span;
+    rect.addEventListener("mouseenter", () => showTooltip(
+      `<strong>${format(binLo)} – ${format(binHi)}</strong>` +
+      `<div class="tt-meta">${c.toLocaleString()} communities (${(100 * c / values.length).toFixed(1)}%)</div>`));
+    rect.addEventListener("mousemove", positionTooltipAt);
+    rect.addEventListener("mouseleave", hideTooltipEl);
+    svg.appendChild(rect);
+  });
+
+  svg.appendChild(svgEl("line", { x1: PAD.l, y1: PAD.t + plotH, x2: PAD.l + plotW, y2: PAD.t + plotH, class: "metric-axis" }));
+  [[lo, PAD.l, "start"], [hi, PAD.l + plotW, "end"]].forEach(([v, x, anchor]) => {
+    const lab = svgEl("text", { x, y: PAD.t + plotH + 13, class: "metric-tick", "text-anchor": anchor });
+    lab.textContent = format(v);
+    svg.appendChild(lab);
+  });
+  const xTitle = svgEl("text", { x: PAD.l + plotW / 2, y: H - 3, class: "metric-axis-title", "text-anchor": "middle" });
+  xTitle.textContent = unit;
+  svg.appendChild(xTitle);
+  wrap.appendChild(svg);
+
+  const note = document.createElement("div");
+  note.className = "metric-tile-note";
+  note.textContent = `${values.length.toLocaleString()} communities shown` + (excludedNote ? ` · ${excludedNote}` : "");
+  wrap.appendChild(note);
+  container.appendChild(wrap);
+}
+
+// ── Size vs health scatter: the clearest real-vs-artifact separation ───────
+function renderScatter(container, opts) {
+  const { title, hint, points, yUnit, yFormat, logY, thresholdY, thresholdLabel, excludedNote } = opts;
+  const W = 300, H = 200, PAD = { l: 46, r: 12, t: 12, b: 42 };
+  const plotW = W - PAD.l - PAD.r, plotH = H - PAD.t - PAD.b;
+  if (!points.length) return;
+
+  // x is log10(size): community sizes span 1 -> ~2,400, so a linear axis would
+  // pile every small community onto the left edge.
+  const xs = points.map((p) => Math.log10(Math.max(1, p.community_size)));
+  const xLo = Math.min(...xs), xHi = Math.max(...xs);
+  const yTransform = (v) => (logY ? Math.log10(Math.max(v, 0.1)) : v);
+  const ys = points.map((p) => yTransform(p.y));
+  const yLo = Math.min(...ys), yHi = Math.max(...ys);
+  const xAt = (v) => PAD.l + ((v - xLo) / (xHi - xLo || 1)) * plotW;
+  const yAt = (v) => PAD.t + plotH - ((v - yLo) / (yHi - yLo || 1)) * plotH;
+
+  const wrap = document.createElement("div");
+  wrap.className = "metric-tile metric-tile-wide";
+  const head = document.createElement("div");
+  head.className = "metric-tile-title";
+  head.textContent = title;
+  wrap.appendChild(head);
+  if (hint) {
+    const p = document.createElement("div");
+    p.className = "metric-tile-hint";
+    p.textContent = hint;
+    wrap.appendChild(p);
+  }
+
+  const svg = svgEl("svg", { viewBox: `0 0 ${W} ${H}`, class: "metric-chart" });
+  for (const t of [1, 0.5, 0]) {
+    const y = PAD.t + plotH * (1 - t);
+    svg.appendChild(svgEl("line", { x1: PAD.l, y1: y, x2: PAD.l + plotW, y2: y, class: "metric-gridline" }));
+    const raw = yLo + (yHi - yLo) * t;
+    const lab = svgEl("text", { x: PAD.l - 5, y: y + 3, class: "metric-tick", "text-anchor": "end" });
+    const value = logY ? Math.pow(10, raw) : raw;
+    lab.textContent = compactNumber(value) ?? yFormat(value);
+    svg.appendChild(lab);
+  }
+  const yTitle = svgEl("text", {
+    x: 11, y: PAD.t + plotH / 2, class: "metric-axis-title",
+    "text-anchor": "middle", transform: `rotate(-90 11 ${PAD.t + plotH / 2})`,
+  });
+  yTitle.textContent = yUnit + (logY ? ", log" : "");
+  svg.appendChild(yTitle);
+
+  if (thresholdY != null && thresholdY > 0) {
+    const ty = yAt(yTransform(thresholdY));
+    if (ty > PAD.t && ty < PAD.t + plotH) {
+      svg.appendChild(svgEl("line", { x1: PAD.l, y1: ty, x2: PAD.l + plotW, y2: ty, class: "metric-threshold" }));
+      const lab = svgEl("text", { x: PAD.l + plotW, y: ty - 3, class: "metric-tick", "text-anchor": "end" });
+      lab.textContent = thresholdLabel || "";
+      svg.appendChild(lab);
+    }
+  }
+
+  for (const p of points) {
+    const band = SIZE_BANDS[sizeBandIndex(p.community_size)];
+    const dot = svgEl("circle", {
+      cx: xAt(Math.log10(Math.max(1, p.community_size))), cy: yAt(yTransform(p.y)),
+      r: 2.2, fill: band.color, class: "metric-scatter-dot",
+    });
+    dot.addEventListener("mouseenter", () => showTooltip(
+      `<strong>Community ${p.community_id}</strong>` +
+      `<div class="tt-meta">${p.community_size.toLocaleString()} papers · ${escapeHtml(band.label)}</div>` +
+      `<div class="tt-meta">${escapeHtml(yUnit)}: ${yFormat(p.y)}</div>`));
+    dot.addEventListener("mousemove", positionTooltipAt);
+    dot.addEventListener("mouseleave", hideTooltipEl);
+    svg.appendChild(dot);
+  }
+
+  svg.appendChild(svgEl("line", { x1: PAD.l, y1: PAD.t + plotH, x2: PAD.l + plotW, y2: PAD.t + plotH, class: "metric-axis" }));
+  for (const tick of [xLo, (xLo + xHi) / 2, xHi]) {
+    const lab = svgEl("text", { x: xAt(tick), y: PAD.t + plotH + 13, class: "metric-tick", "text-anchor": "middle" });
+    lab.textContent = Math.round(Math.pow(10, tick)).toLocaleString();
+    svg.appendChild(lab);
+  }
+  const xTitle = svgEl("text", { x: PAD.l + plotW / 2, y: H - 3, class: "metric-axis-title", "text-anchor": "middle" });
+  xTitle.textContent = "Community size (papers, log)";
+  svg.appendChild(xTitle);
+  wrap.appendChild(svg);
+
+  const legend = document.createElement("div");
+  legend.className = "metric-band-legend";
+  legend.innerHTML = SIZE_BANDS.map((b) =>
+    `<span class="mbl-item"><i style="background:${b.color}"></i>${escapeHtml(b.label)}</span>`).join("");
+  wrap.appendChild(legend);
+  if (excludedNote) {
+    const note = document.createElement("div");
+    note.className = "metric-tile-note";
+    note.textContent = excludedNote;
+    wrap.appendChild(note);
+  }
+  container.appendChild(wrap);
+}
+
+// ── Headline health numbers for the selected resolution ───────────────────
+function renderHealthSummaryStrip() {
+  const host = document.getElementById("health-summary");
+  if (!host) return;
+  const rm = currentResolutionMetrics();
+  if (!rm) { host.innerHTML = ""; return; }
+
+  const pct = (v) => (v == null ? "—" : `${(100 * v).toFixed(1)}%`);
+  const n = (v) => (v == null ? "—" : Math.round(v).toLocaleString());
+  const singletonShareOfCommunities = rm.number_of_communities
+    ? rm.number_of_singleton_communities / rm.number_of_communities : null;
+
+  const tiles = [
+    {
+      value: n(rm.number_of_statistically_dense_communities),
+      of: `of ${n(rm.number_of_communities)} communities`,
+      label: "Denser than chance",
+      note: `Bonferroni-corrected p &lt; 0.05 (surprise &ge; ${rm.statistical_density_surprise_threshold != null ? rm.statistical_density_surprise_threshold.toFixed(1) : "—"} nats)`,
+    },
+    {
+      value: pct(rm.share_of_nodes_in_statistically_dense_communities),
+      of: "of all papers",
+      label: "Live in those communities",
+      note: "The artifact mass is large in count but small in corpus share",
+    },
+    {
+      value: pct(singletonShareOfCommunities),
+      of: `= ${pct(rm.share_of_nodes_in_singleton_communities)} of papers`,
+      label: "Singletons",
+      note: "Why counting communities misleads: most communities, few papers",
+    },
+    {
+      value: rm.conductance_median_over_substantive_communities != null
+        ? rm.conductance_median_over_substantive_communities.toFixed(3) : "—",
+      of: `over ${n(rm.number_of_substantive_communities)} substantive communities`,
+      label: "Median conductance",
+      note: "Over all communities this reads 1.0 — the singleton artifact",
+    },
+  ];
+
+  host.innerHTML = tiles.map((t) => `
+    <div class="health-tile">
+      <div class="ht-value">${t.value}</div>
+      <div class="ht-of">${t.of}</div>
+      <div class="ht-label">${t.label}</div>
+      <div class="ht-note">${t.note}</div>
+    </div>`).join("");
+}
+
+// ── Across-resolution health table (also the required table view) ─────────
+function renderHealthTable() {
+  const host = document.getElementById("health-table");
+  if (!host || !state.resolutionMetrics) return;
+  const rows = state.resolutionMetrics.resolutions;
+  const pct = (v) => (v == null ? "—" : `${(100 * v).toFixed(1)}%`);
+  const num = (v, d = 3) => (v == null ? "—" : v.toFixed(d));
+
+  host.innerHTML = `
+    <table class="health-table">
+      <caption>Per-community health summarized per resolution. Every column names its
+        population — an aggregate over <em>all</em> communities is dominated by singletons.</caption>
+      <thead><tr>
+        <th>Resolution</th><th>Communities</th><th>Denser than chance</th>
+        <th>Papers in those</th><th>Singletons</th><th>Papers in singletons</th>
+        <th>Median conductance (substantive)</th><th>Median density (size&nbsp;&ge;&nbsp;2)</th>
+        <th>Papers in substantive</th>
+      </tr></thead>
+      <tbody>${rows.map((r) => {
+        const active = String(r.resolution) === String(state.communityResolution);
+        return `<tr class="${active ? "active" : ""}">
+          <th scope="row">${r.resolution}</th>
+          <td>${(r.number_of_communities || 0).toLocaleString()}</td>
+          <td>${(r.number_of_statistically_dense_communities || 0).toLocaleString()}
+              (${pct(r.share_of_communities_that_are_statistically_dense)})</td>
+          <td>${pct(r.share_of_nodes_in_statistically_dense_communities)}</td>
+          <td>${(r.number_of_singleton_communities || 0).toLocaleString()}</td>
+          <td>${pct(r.share_of_nodes_in_singleton_communities)}</td>
+          <td>${num(r.conductance_median_over_substantive_communities)}</td>
+          <td>${num(r.internal_edge_density_median_over_communities_with_at_least_2_nodes)}</td>
+          <td>${pct(r.share_of_nodes_in_substantive_communities)}</td>
+        </tr>`;
+      }).join("")}</tbody>
+    </table>`;
+}
+
+// ── Interactive views for the selected resolution ─────────────────────────
+function renderSelectedResolutionHealth() {
+  const grid = document.getElementById("health-selected-grid");
+  if (!grid) return;
+  const dist = currentDistribution();
+  if (!dist) { grid.innerHTML = ""; return; }
+
+  const singletonCount = dist.filter((d) => d.community_size === 1).length;
+  const shown = state.healthExcludeSingletons
+    ? dist.filter((d) => d.community_size > 1) : dist;
+  const excludedNote = state.healthExcludeSingletons && singletonCount
+    ? `${singletonCount.toLocaleString()} singletons excluded`
+    : null;
+  grid.innerHTML = "";
+
+  const histMetric = HEALTH_METRICS[state.healthHistogramMetric];
+  renderHistogram(grid, {
+    title: `${histMetric.label} — distribution at resolution ${state.communityResolution}`,
+    hint: histMetric.hint,
+    values: shown.map((d) => d[state.healthHistogramMetric]),
+    unit: histMetric.unit,
+    format: histMetric.format,
+    excludedNote,
+  });
+
+  const rm = currentResolutionMetrics();
+  const scatterMetric = HEALTH_METRICS[state.healthScatterMetric];
+  renderScatter(grid, {
+    title: `Size vs. ${scatterMetric.label.toLowerCase()} at resolution ${state.communityResolution}`,
+    hint: "Each dot is one community. Real communities climb with size; artifacts sit low and to the left.",
+    points: shown.map((d) => ({ ...d, y: d[state.healthScatterMetric] })),
+    yUnit: scatterMetric.unit,
+    yFormat: scatterMetric.format,
+    logY: scatterMetric.logY,
+    thresholdY: state.healthScatterMetric === "internal_edge_surprise" && rm
+      ? rm.statistical_density_surprise_threshold : null,
+    thresholdLabel: "denser than chance ↑",
+    excludedNote,
+  });
+}
+
+// ── Panel orchestration ───────────────────────────────────────────────────
+function renderCommunityHealthPanel() {
+  const section = document.getElementById("view-health-section");
+  if (!section) return;
+  if (!state.communityDistributions || !state.resolutionMetrics) {
+    section.hidden = true;
+    return;
+  }
+  section.hidden = false;
+
+  // Composition + percentile ribbons across resolutions (static).
+  const acrossGrid = document.getElementById("health-across-grid");
+  if (acrossGrid) {
+    acrossGrid.innerHTML = "";
+    const byRes = state.communityDistributions.by_resolution;
+    const resolutions = Object.keys(byRes).sort((a, b) => parseFloat(a) - parseFloat(b));
+
+    const rows = resolutions.map((res) => {
+      const sizes = byRes[res].community_size;
+      const counts = [0, 0, 0, 0];
+      const nodes = [0, 0, 0, 0];
+      let totalNodes = 0;
+      for (const s of sizes) {
+        const b = sizeBandIndex(s);
+        counts[b] += 1;
+        nodes[b] += s;
+        totalNodes += s;
+      }
+      return {
+        resolution: res, counts, total: sizes.length,
+        nodeShares: nodes.map((v) => (totalNodes ? 100 * v / totalNodes : 0)),
+      };
+    });
+    renderStackedBars(acrossGrid, {
+      title: "What each partition is made of",
+      hint: "Communities by size band. Most are singletons or 2–3 paper fragments — the artifact mass that never reaches the map's legend.",
+      rows,
+      onBarClick: onResolutionPointClick,
+    });
+
+    // Percentile ribbons over substantive communities only, so the bands track
+    // real structure rather than the singleton pile.
+    for (const key of ["internal_edge_surprise", "internal_edge_density", "conductance"]) {
+      const meta = HEALTH_METRICS[key];
+      const points = resolutions.map((res) => {
+        const d = byRes[res];
+        const vals = [];
+        for (let i = 0; i < d.community_size.length; i += 1) {
+          if (d.community_size[i] >= SUBSTANTIVE_MIN_SIZE) vals.push(d[key][i]);
+        }
+        vals.sort((a, b) => a - b);
+        return {
+          x: res,
+          y: percentileOfSorted(vals, 0.5),
+          lo: percentileOfSorted(vals, 0.25),
+          hi: percentileOfSorted(vals, 0.75),
+        };
+      });
+      renderLineChart(acrossGrid, {
+        title: `${meta.label} of substantive communities`,
+        hint: `Median with the 25th–75th percentile band, over communities of ${SUBSTANTIVE_MIN_SIZE}+ papers only.`,
+        unit: meta.unit,
+        points,
+        band: points,
+        format: meta.format,
+        onPointClick: onResolutionPointClick,
+      });
+    }
+  }
+
+  renderHealthSummaryStrip();
+  renderHealthTable();
+  renderSelectedResolutionHealth();
+}
+
+// Metric pickers + singleton toggle for the selected-resolution views.
+function initHealthControls() {
+  const hist = document.getElementById("health-histogram-metric");
+  const scatter = document.getElementById("health-scatter-metric");
+  const toggle = document.getElementById("health-exclude-singletons");
+  const options = Object.entries(HEALTH_METRICS)
+    .map(([k, m]) => `<option value="${k}">${m.label}</option>`).join("");
+  if (hist) {
+    hist.innerHTML = options;
+    hist.value = state.healthHistogramMetric;
+    hist.addEventListener("change", (e) => {
+      state.healthHistogramMetric = e.target.value;
+      renderSelectedResolutionHealth();
+    });
+  }
+  if (scatter) {
+    scatter.innerHTML = options;
+    scatter.value = state.healthScatterMetric;
+    scatter.addEventListener("change", (e) => {
+      state.healthScatterMetric = e.target.value;
+      renderSelectedResolutionHealth();
+    });
+  }
+  if (toggle) {
+    toggle.checked = state.healthExcludeSingletons;
+    toggle.addEventListener("change", (e) => {
+      state.healthExcludeSingletons = e.target.checked;
+      renderSelectedResolutionHealth();
+    });
+  }
+}
+
+// ── Per-community keyword bars ─────────────────────────────────────────────
+// community_keywords.json (build_website.py): resolution -> community id ->
+// ranked [{keyword, score}], for every named community. `source` is "pipeline"
+// (community_keywords.py: synonym-aware, corrected IDF) or "site" (the quick
+// TF-IDF over the papers' own keyword fields that also names the legend).
+function keywordItemsFor(resolution, gid) {
+  const ck = state.communityKeywords;
+  if (!ck || !ck.by_resolution || resolution == null) return null;
+  const atRes = ck.by_resolution[String(resolution)];
+  const items = atRes && atRes[String(gid)];
+  return items && items.length ? items : null;
+}
+
+function truncateLabel(s, n) {
+  s = String(s);
+  return s.length > n ? s.slice(0, n - 1) + "…" : s;
+}
+
+// Horizontal bars, one per keyword, longest = the community's top score. Drawn
+// to scale within the tile; the full keyword + score is in the hover title.
+function renderKeywordBars(container, opts) {
+  const { items, color, maxBars = 10 } = opts;
+  const shown = items.slice(0, maxBars);
+  if (!shown.length) return;
+  const W = 300, ROW = 15, PAD = { l: 6, r: 40, t: 4, b: 4 }, LABEL_W = 132;
+  const H = PAD.t + PAD.b + shown.length * ROW;
+  const barX = PAD.l + LABEL_W;
+  const barMax = W - barX - PAD.r;
+  const max = Math.max(...shown.map((d) => d.score)) || 1;
+  const svg = svgEl("svg", { viewBox: `0 0 ${W} ${H}`, class: "keyword-bars" });
+  shown.forEach((d, i) => {
+    const y = PAD.t + i * ROW;
+    const label = svgEl("text", { x: barX - 5, y: y + ROW - 4, class: "kw-label", "text-anchor": "end" });
+    label.textContent = truncateLabel(d.keyword, 24);
+    const title = svgEl("title", {});
+    title.textContent = `${d.keyword}: ${d.score}`;
+    label.appendChild(title);
+    svg.appendChild(label);
+    svg.appendChild(svgEl("rect", { x: barX, y: y + 3, width: barMax, height: ROW - 6, rx: 2, class: "kw-bar-track" }));
+    const w = Math.max(1, (d.score / max) * barMax);
+    const bar = svgEl("rect", { x: barX, y: y + 3, width: w, height: ROW - 6, rx: 2, class: "kw-bar" });
+    if (color) bar.setAttribute("style", `fill:${color}`);
+    svg.appendChild(bar);
+    const val = svgEl("text", { x: barX + w + 4, y: y + ROW - 4, class: "kw-value" });
+    val.textContent = Number(d.score).toFixed(3);
+    svg.appendChild(val);
+  });
+  container.appendChild(svg);
+}
+
+// Metrics tab section: one tile per named community at the selected
+// resolution (largest first). Hidden when the dataset has no keyword data.
+function renderKeywordsSection() {
+  const section = document.getElementById("view-keywords-section");
+  const grid = document.getElementById("keywords-grid");
+  if (!section || !grid) return;
+  const res = state.communityResolution;
+  const legend = state.groupData.community || {};
+  const ids = Object.keys(legend).filter((cid) => keywordItemsFor(res, cid));
+  if (!state.communityKeywords || !ids.length) {
+    section.hidden = true;
+    grid.innerHTML = "";
+    return;
+  }
+  section.hidden = false;
+  const meta = document.getElementById("keywords-meta");
+  if (meta) {
+    const ck = state.communityKeywords;
+    const how = ck.source === "pipeline"
+      ? "from community_keywords.py (each community's synonym-canonicalised keyword list is one document; corrected IDF)"
+      : "computed by the site from the papers' own keyword fields";
+    meta.textContent = `${ids.length} named communities at resolution ${res}. Bars are ${ck.score_label || "TF-IDF"} scores ${how}. Click a community's name to open it on the map.`;
+  }
+  grid.innerHTML = "";
+  ids.sort((a, b) => (legend[b].size || 0) - (legend[a].size || 0));
+  const cg = citationGrouping();
+  for (const cid of ids) {
+    const c = legend[cid];
+    const tile = document.createElement("div");
+    tile.className = "metric-tile";
+    const head = document.createElement("div");
+    head.className = "keyword-tile-title";
+    const swatch = document.createElement("span");
+    swatch.className = "swatch";
+    swatch.style.background = c.color;
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.textContent = c.name;
+    btn.title = c.name;
+    btn.addEventListener("click", () => { if (cg) openCommunityFromKeywords(cg.key, cid); });
+    head.appendChild(swatch);
+    head.appendChild(btn);
+    tile.appendChild(head);
+    const hint = document.createElement("div");
+    hint.className = "metric-tile-hint";
+    hint.textContent = `${(c.size || 0).toLocaleString()} papers · community ${cid}`;
+    tile.appendChild(hint);
+    renderKeywordBars(tile, { items: keywordItemsFor(res, cid), color: c.color });
+    grid.appendChild(tile);
+  }
+}
+
+// From a keyword tile to the map: switch to the Graph tab, colour by the
+// citation grouping (through the normal Color-by control so every side effect
+// runs), then open + frame the community.
+function openCommunityFromKeywords(key, gid) {
+  document.getElementById("tab-graph")?.click();
+  const sel = document.getElementById("color-by");
+  if (sel && sel.value !== key) {
+    sel.value = key;
+    sel.dispatchEvent(new Event("change"));
+  }
+  showGroupDetail(key, gid);
+  frameGroup(key, gid);
+}
+
+// ── Figures tab ────────────────────────────────────────────────────────────
+// figures.json (build_website.py): { site_graph, figures_dir, figures: [{file,
+// kind, graph, resolution, title}] }. Figures are static files copied next to
+// the data; the gallery only filters and labels them.
+async function setupFigures(cfg) {
+  state.figures = null;
+  const tab = document.getElementById("tab-figures");
+  if (tab) tab.hidden = true;
+  let figs = null;
+  try {
+    figs = await fetch(`${sharedDir(cfg)}/figures.json`).then((r) => (r.ok ? r.json() : null));
+  } catch {
+    figs = null;
+  }
+  if (!figs || !Array.isArray(figs.figures) || !figs.figures.length) return;
+  state.figures = figs;
+  if (tab) tab.hidden = false;
+  const cb = document.getElementById("figures-follow-resolution");
+  if (cb && !cb.dataset.wired) {
+    cb.dataset.wired = "1";
+    cb.checked = state.figuresFollowResolution;
+    cb.addEventListener("change", (e) => {
+      state.figuresFollowResolution = e.target.checked;
+      renderFiguresGallery();
+    });
+  }
+  renderFiguresGallery();
+}
+
+function renderFiguresGallery() {
+  const grid = document.getElementById("figures-grid");
+  const count = document.getElementById("figures-count");
+  if (!grid) return;
+  grid.innerHTML = "";
+  const figs = state.figures;
+  if (!figs) return;
+  const res = state.communityResolution;
+  const follow = state.figuresFollowResolution && res != null;
+  const base = figs.figures_dir || "figures";
+  // A figure "belongs" to this map when it was made on the same graph (or
+  // declares none). Figures from another graph can never line up with the
+  // dropdown's community ids, so they are always listed -- and marked.
+  const sameGraph = (f) => !f.graph || !figs.site_graph || figs.site_graph.includes(f.graph);
+  const visible = figs.figures.filter((f) => {
+    if (!follow || f.resolution == null || !sameGraph(f)) return true;
+    return String(f.resolution) === String(res);
+  });
+  if (count) count.textContent = `${visible.length} of ${figs.figures.length} figures`;
+  if (!visible.length) {
+    const p = document.createElement("div");
+    p.className = "figures-empty";
+    p.textContent = `No figures for resolution ${res}. Untick the box to see all ${figs.figures.length}.`;
+    grid.appendChild(p);
+    return;
+  }
+  for (const f of visible) {
+    const card = document.createElement("div");
+    card.className = "figure-card";
+    const title = document.createElement("div");
+    title.className = "figure-title";
+    title.textContent = f.title || f.file;
+    card.appendChild(title);
+    const tags = document.createElement("div");
+    tags.className = "figure-tags";
+    const tag = (text, cls) => {
+      const s = document.createElement("span");
+      s.className = "figure-tag" + (cls ? " " + cls : "");
+      s.textContent = text;
+      tags.appendChild(s);
+    };
+    if (f.kind) tag(f.kind.replace(/-/g, " "));
+    if (f.resolution != null) tag(`resolution ${f.resolution}`);
+    if (f.graph) tag(sameGraph(f) ? `graph: ${f.graph}` : `other graph: ${f.graph}`, sameGraph(f) ? "" : "other-graph");
+    card.appendChild(tags);
+    const src = `${base}/${encodeURIComponent(f.file)}`;
+    const img = document.createElement("img");
+    img.src = src;
+    img.alt = f.title || f.file;
+    img.loading = "lazy";
+    card.appendChild(img);
+    const link = document.createElement("a");
+    link.href = src;
+    link.target = "_blank";
+    link.rel = "noopener";
+    link.className = "meta";
+    link.textContent = "Open full size";
+    card.appendChild(link);
+    grid.appendChild(card);
+  }
 }
 
 // ── Utils ─────────────────────────────────────────────────────────────────
