@@ -30,11 +30,12 @@ The **View** menu picks the layout:
 
 - **Citation network** (all 22,982 papers): a ForceAtlas2 layout of the
   citation graph, so papers that cite each other sit together.
-- **Gemini embedding** and **SPECTER2 embedding** (14,511 papers each): a 2-D
-  UMAP of each paper's text embedding, so papers with similar content sit
-  together. Only these papers have embeddings; the others appear in the
-  citation view only. The Gemini view has a **Time** menu: the field as it
-  stood up to 1980 / 1990 / 2000 / 2010.
+- **Gemini embedding** and **SPECTER2 embedding** (all 22,982 papers): a 2-D
+  UMAP of each paper's text embedding (its cleaned title and abstract), so
+  papers with similar content sit together, coloured by citation community or
+  by the embedding's own **topics** (BERTopic: 47 for Gemini, 55 for SPECTER2).
+  The Gemini view has a **Time** menu: the field as it stood up to 1980 / 1990
+  / 2000 / 2010, each laid out from its own papers.
 
 In every view:
 
@@ -101,8 +102,12 @@ before the analysis (the previous version kept only papers with at least five
 citations within the corpus); the well-connected filter above replaces that cut. The citation
 graph, communities, metrics, keyword names and this site come from the
 Scientographer pipeline, run as a DVC project (`test-dags-scientographer` on
-DagsHub). The Gemini and SPECTER2 layouts, clusters, topics and time snapshots
-are those of the previous version of this map, carried over by DOI.
+DagsHub). The embedding views come from the same pipeline: every paper embedded
+with Gemini (`gemini-embedding-2`, 3072 dimensions; the previous version's
+vectors reused where the text is unchanged) and with SPECTER2
+(`allenai/specter2_base` with its proximity adapter, run locally); topics from
+BERTopic (UMAP to 5 dimensions, HDBSCAN with a minimum of 50 papers, c-TF-IDF
+names); positions from a separate 2-D UMAP.
 
 ## Credits
 
