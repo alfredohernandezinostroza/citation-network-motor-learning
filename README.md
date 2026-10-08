@@ -40,7 +40,7 @@ The **View** menu picks the layout:
 In every view:
 
 - **Colour by** citation **community** (Leiden/CPM on the directed citation
-  graph), the layout's own **clusters / topics** (embedding views), **year**,
+  graph), the embedding **topics** (BERTopic; on the citation network, Gemini's), **year**,
   **citations** or **integration**.
 - **Community resolution**: 46 resolutions from 0.0001 (a few large
   communities) to 0.9; the map opens at 0.0015. The choice carries across views. Communities are named
@@ -86,7 +86,7 @@ In every view:
 - `network_data/`: the citation-network view, plus files every view shares
   (metrics, keywords, figure index, abstracts).
 - `gemini_data/`, `specter2_data/`: the embedding views (positions, their
-  clusters/topics, communities at every resolution, citations among their
+  topics, communities at every resolution, citations among their
   papers, and Gemini's time snapshots).
 - `figures/`: images shown in the Figures tab.
 
