@@ -87,7 +87,8 @@ In every view:
   legend also hides its label. Search and filters match **whole words** (with
   plurals) by default, so "dance" doesn't find "guidance"; the **Text matching**
   menu switches to word beginnings, anywhere, or regular expressions.
-  Comma-separated filter queries must all match.
+  A comma means AND, `|` means OR, and quoted text is matched literally, so
+  pasting titles finds exactly those papers: `"First title" | "Second title"`.
 
 ## Files
 
