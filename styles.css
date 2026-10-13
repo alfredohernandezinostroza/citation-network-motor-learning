@@ -38,10 +38,17 @@ html, body {
 }
 .view.active { display: block; }
 
-#sigma-container {
+#sigma-container,
+#three-container {
   position: absolute;
   inset: 0;
 }
+#three-container canvas { display: block; }
+#sigma-container[hidden], #three-container[hidden],
+[data-view-2d][hidden], [data-view-3d][hidden] { display: none !important; }
+.orientation-buttons + .orientation-buttons { margin-top: 6px; }
+.orientation-buttons button#auto-rotate { flex: 2.4; font-size: 11px; }
+.orientation-buttons button[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); }
 /* ── Quick jump search results ────────────────────────────────────────── */
 #search-results {
   list-style: none;
@@ -267,6 +274,7 @@ html, body {
   margin-top: 6px;
 }
 #controls input[type="search"]:focus { border-color: var(--accent); }
+#controls input[type="search"][hidden] { display: none; }
 
 .control-row {
   margin-top: 10px;

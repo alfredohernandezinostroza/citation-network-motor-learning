@@ -2,8 +2,8 @@
 
 An interactive, browsable map of the **motor-learning research literature**
 (22,982 papers, 183,808 citations among them). Each dot is a paper. Switch
-between the **citation-network layout** and two **text-embedding layouts**
-(Gemini, SPECTER2), colour the papers by citation community at any of 46
+between **citation-network layouts** in 2D and 3D and two **text-embedding
+layouts** (Gemini, SPECTER2), colour the papers by citation community at any of 46
 resolutions, by semantic topic, year or citation count, map where any word
 appears, and export what you see as a high-resolution image.
 
@@ -26,10 +26,19 @@ An internet connection is needed at runtime for the CDN-hosted libraries.
 
 ## What you see
 
-The **View** menu picks the layout:
+The **View** menu picks the layout; the map opens on the 3D one:
 
-- **Citation network** (all 22,982 papers): a ForceAtlas2 layout of the
-  citation graph, so papers that cite each other sit together.
+- **Citation network (3D)**: the citation graph laid out by ForceAtlas2 in
+  three dimensions, so papers that cite each other sit together. Drag to turn,
+  scroll to zoom; it turns slowly on its own until you stop it (**Auto-rotate**),
+  and the orientation buttons also turn and tilt it. It opens lined up with the
+  2D map, so the communities start where the 2D map has them.
+- **Citation network** (all 22,982 papers): the same ForceAtlas2 layout in 2D.
+- **Citation network (LinLog)** and **(LinLog, 3D)**: ForceAtlas2 in LinLog
+  mode, where the pull along a citation grows with the logarithm of the
+  distance, so communities drift apart into separate islands. A third of each
+  paper's nearest papers are papers it cites or that cite it (against 1 in 20
+  in the standard 2D map).
 - **Gemini embedding** and **SPECTER2 embedding** (all 22,982 papers): a 2-D
   UMAP of each paper's text embedding (its cleaned title and abstract), so
   papers with similar content sit together, coloured by citation community or
@@ -66,7 +75,9 @@ In every view:
   has its own controls for both, kept in sync with the Graph tab).
 - **Orientation**: the map opens with the main body's long axis horizontal, its
   long tail down and its most-cited side on the left; rotate or mirror it.
-- **Export image**: the current view or the whole map as a PNG of up to
+  **Dot size** makes every paper bigger or smaller; dots grow with the citations a
+  paper receives within the corpus.
+- **Export image** (2D views): the current view or the whole map as a PNG of up to
   12,000 px, with straight or curved (Gephi-style) citation edges, transparent
   (styled for white pages or for dark slides) or on a white or dark background.
   Only the visible papers and communities are drawn.
