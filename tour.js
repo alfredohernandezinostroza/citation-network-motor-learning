@@ -104,8 +104,19 @@ const STEPS = [
     row: true,
     title: "Bridge papers",
     body:
-      "Highlight <strong>bridge papers</strong> — the ones that link otherwise " +
-      "separate parts of the map.",
+      "Highlight <strong>bridge papers</strong> in gold: the 50 papers whose citation " +
+      "links reach across communities the most (participation coefficient × ln(links)), " +
+      "so they connect otherwise separate parts of the map.",
+  },
+  {
+    target: "#top-papers-toggle",
+    row: true,
+    title: "Top papers",
+    body:
+      "Highlight in white the <strong>five top papers</strong> of every community " +
+      "(or topic, when coloured by topic), ranked by citations, citations from " +
+      "within the community, citations per year or PageRank. The same ranking " +
+      "orders the top papers in a community's panel.",
   },
   {
     target: "#edges-toggle",
@@ -164,9 +175,10 @@ const STEPS = [
     target: ".about",
     title: "That's the tour!",
     body:
-      "Open <strong>About this map</strong> any time for a fuller explanation of the " +
-      "layouts and overlays. Replay this tour from the <strong>Guided tour</strong> " +
-      "button in the corner. Happy exploring!",
+      "Open <strong>Help</strong> any time for a fuller explanation of the " +
+      "layouts and overlays, and the compass in the bottom-right corner for " +
+      "<strong>About this map: how it was made</strong>. Replay this tour from the " +
+      "<strong>Guided tour</strong> button in the corner. Happy exploring!",
   },
 ];
 

@@ -16,7 +16,20 @@
 
 import Graph from "https://cdn.jsdelivr.net/npm/graphology@0.25.4/+esm";
 import { Sigma } from "https://cdn.jsdelivr.net/npm/sigma@2.4.0/+esm";
+// Sigma's one-pixel edge lines; the CommonJS module's class is on its `default`.
+import edgeFastModule from "https://cdn.jsdelivr.net/npm/sigma@2.4.0/rendering/webgl/programs/edge.fast/+esm";
+const EdgeFastProgram = edgeFastModule.default;
 import { MATCH_MODES, makeFilter } from "./textmatch.js?v=2";
+import {
+  BRIDGE_MIN_LINKS,
+  BRIDGE_COUNT,
+  DEFAULT_RANKING,
+  RANKINGS,
+  bridgePapers,
+  participationCoefficients,
+  rankingScores,
+  topPapersByGroup,
+} from "./rankings.js?v=2";
 
 // ── Dataset definitions ─────────────────────────────────────────────────────
 // Each grouping: key (also the "Color by" value), label (detail panel + color
@@ -111,6 +124,16 @@ const state = {
   legendEls: {}, // grouping key -> <ul> element
   colorBy: "topic", // a grouping key | year | indegree
   highlightBridges: false,
+  // Bridge papers (rankings.js): every paper's participation coefficient at the
+  // current community resolution, computed when first needed and dropped when
+  // the resolution or the view changes. See bridgeData().
+  bridges: null, // { resolution, coefficient, links, communitiesReached, bridge } | null
+  // Top papers per group: one ranking (a rankings.js RANKINGS key) shared by the
+  // "Highlight top papers" menu and the group panel's "Rank top papers by" menu.
+  highlightTopPapers: false,
+  topPaperRanking: DEFAULT_RANKING,
+  topPapers: null, // Map(grouping|ranking|resolution -> { byGroup, scores, set }), see topPapersFor()
+  detailGroup: null, // { key, gid } of the open group panel, else null
   showEdges: false,
   _citeLayerBuilt: false,
   shiftDown: false,
@@ -168,6 +191,12 @@ const state = {
   // into the graph and every centroid read from the data, see orient().
   orientation: { angle: 0, flipX: false, flipY: false }, // angle in degrees
   dotScale: 1, // the Dot size slider
+  // The Edge opacity and Edge thickness (pixels) sliders. Each citation is drawn
+  // on its own, so in the dense middle of the map many overlap; a low opacity
+  // keeps their colours apart. (The PNG export strokes all edges of one colour as
+  // one path, whose overlaps do not add up.)
+  edgeOpacity: 0.2,
+  edgeWidth: 0.5,
 
   // The Connectivity Modifier's verdict per resolution (well_connected.json):
   // { n, resolutions: { "<r>": base64 bitset } }, decoded lazily into masks.
@@ -248,10 +277,398 @@ window.scientographer = {
   },
 };
 
+// How the map was made (build_website.py writes network_data/provenance.json):
+// the Scientographer version and the build date, shown under the logo while the
+// map loads and next to the badge after. Older sites have no such file; then
+// nothing is shown.
+async function loadProvenance() {
+  try {
+    const response = await fetch(`${sharedDir(DATASETS[DEFAULT_DATASET])}/provenance.json`);
+    const provenance = response.ok ? await response.json() : null;
+    return provenance && typeof provenance.scientographer === "string" ? provenance : null;
+  } catch {
+    return null;
+  }
+}
+
+function showLoadingVersion(provenance) {
+  const el = document.getElementById("loading-version");
+  if (!el || !provenance) return;
+  el.textContent = provenance.scientographer;
+  el.hidden = false;
+}
+
+function showProvenanceStamp(provenance) {
+  if (!provenance) return;
+  const built = typeof provenance.built === "string" ? provenance.built.slice(0, 10) : "";
+  const text = `Scientographer ${provenance.scientographer}` + (built ? ` \u00b7 built ${built}` : "");
+  const stamp = document.getElementById("provenance-stamp");
+  if (stamp) {
+    stamp.textContent = text;
+    stamp.hidden = false;
+  }
+  const badge = document.getElementById("scientographer-badge");
+  if (badge) {
+    badge.title = `About this map: how it was made (${text})`;
+    badge.setAttribute("aria-label", `About this map: how it was made (${text})`);
+  }
+}
+
+// ── About this map: how it was made ──────────────────────────────────────
+// provenance.json lists every step that made the map, oldest first: the
+// stage, the Scientographer version, its settings, its input files (with md5
+// and `from_step`, the earlier step that wrote the file) and its outputs.
+// Older sites have no such file; the panel then says so.
+function shortDate(text) {
+  if (typeof text !== "string" || !text) return "";
+  return text.replace("T", " ").replace(/:\d\dZ$/, " UTC").replace(/Z$/, " UTC");
+}
+
+function aboutParagraph(text) {
+  const p = document.createElement("p");
+  p.textContent = text;
+  return p;
+}
+
+function aboutFileList(label, entries, steps) {
+  const wrap = document.createDocumentFragment();
+  if (!entries.length) return wrap;
+  const head = document.createElement("div");
+  head.className = "about-label";
+  head.textContent = label;
+  wrap.appendChild(head);
+  const list = document.createElement("ul");
+  list.className = "about-files";
+  for (const entry of entries) {
+    const item = document.createElement("li");
+    const path = document.createElement("code");
+    path.className = "about-path";
+    path.textContent = entry.path;
+    path.title = entry.path;
+    item.appendChild(path);
+    if (entry.md5 !== undefined) {
+      const md5 = document.createElement("code");
+      md5.className = "about-md5";
+      md5.textContent = entry.md5 ? entry.md5.slice(0, 8) : "no checksum";
+      md5.title = entry.md5
+        ? `md5 ${entry.md5}`
+        : (entry.files != null ? `${entry.files} files, ${entry.bytes} bytes: too large to checksum` : "missing when the step ran");
+      item.appendChild(md5);
+    }
+    const from = Number.isInteger(entry.from_step) ? steps[entry.from_step] : null;
+    if (from) {
+      const note = document.createElement("span");
+      note.className = "about-from";
+      note.append("reads the output of ");
+      const link = document.createElement("a");
+      link.href = `#about-step-${entry.from_step}`;
+      link.textContent = from.stage || `step ${entry.from_step + 1}`;
+      note.appendChild(link);
+      item.appendChild(note);
+    }
+    list.appendChild(item);
+  }
+  wrap.appendChild(list);
+  return wrap;
+}
+
+// The environment: provenance.environment is the one that built the site (Python,
+// platform, every installed package, the lock); each step's `environment` has its
+// key packages. Records made before environments were kept have neither.
+function lockLine(lock) {
+  if (!lock || typeof lock !== "object") return "";
+  if (!lock.kind) return "No lock file: the environment is recorded but was not pinned.";
+  const md5 = lock.md5 ? `, md5 ${String(lock.md5).slice(0, 8)}` : "";
+  const where = lock.environment ? ` (environment ${lock.environment}, ${lock.platform})` : "";
+  if (lock.matches) return `Matches ${lock.path}${where}${md5}.`;
+  const n = Array.isArray(lock.differences) ? lock.differences.length : 0;
+  return `Does not match ${lock.path}${where}${md5}${lock.override ? " (run with the override)" : ""}: ` +
+    `${n} difference${n === 1 ? "" : "s"}.`;
+}
+
+function requirementsText(environment, provenance) {
+  const lines = [
+    `# The environment that built this map: Python ${environment.python || "?"} on ${environment.platform || "?"}`,
+    `# Scientographer ${provenance.scientographer}, built ${shortDate(provenance.built)}`,
+  ];
+  for (const [name, version] of Object.entries(environment.packages || {})) lines.push(`${name}==${version}`);
+  return lines.join("\n") + "\n";
+}
+
+function renderEnvironment(provenance) {
+  const box = document.getElementById("about-environment");
+  if (!box) return;
+  box.replaceChildren();
+  const environment = provenance && provenance.environment;
+  if (!environment || typeof environment !== "object") {
+    box.hidden = true;
+    return;
+  }
+  box.hidden = false;
+  const details = document.createElement("details");
+  details.id = "about-environment-details";
+  const label = document.createElement("summary");
+  const packages = Object.entries(environment.packages || {});
+  label.textContent = `Environment: Python ${environment.python || "?"}, ${packages.length} packages`;
+  details.appendChild(label);
+  details.appendChild(aboutParagraph(
+    `The environment that built the site: Python ${environment.python || "?"} on ${environment.platform || "?"}.`));
+  const lock = lockLine(environment.lock);
+  if (lock) details.appendChild(aboutParagraph(lock));
+  const list = document.createElement("ul");
+  list.className = "about-package-list";
+  for (const [name, version] of packages) {
+    const item = document.createElement("li");
+    const code = document.createElement("code");
+    code.textContent = `${name} ${version}`;
+    item.appendChild(code);
+    list.appendChild(item);
+  }
+  details.appendChild(list);
+  const download = document.createElement("a");
+  download.className = "about-download";
+  download.textContent = "Download the package list (requirements.txt)";
+  download.download = "requirements.txt";
+  // A few KB of text, made once when the panel is filled.
+  download.href = URL.createObjectURL(new Blob([requirementsText(environment, provenance)], { type: "text/plain" }));
+  details.appendChild(download);
+  box.appendChild(details);
+}
+
+// One step's key packages, compactly: "Python 3.12.4 · igraph 0.11.8 · leidenalg 0.10.2".
+function stepEnvironmentLine(step) {
+  const environment = step && step.environment;
+  if (!environment || typeof environment !== "object") return null;
+  const parts = environment.python ? [`Python ${environment.python}`] : [];
+  for (const [name, version] of Object.entries(environment.packages || {})) parts.push(`${name} ${version}`);
+  const line = document.createElement("div");
+  line.className = "about-step-packages";
+  line.textContent = parts.join(" \u00b7 ");
+  const lock = environment.lock;
+  if (lock && lock.kind && lock.matches === false) {
+    const flag = document.createElement("span");
+    flag.className = "about-override";
+    flag.textContent = lock.override ? ` outside ${lock.path} (override)` : ` does not match ${lock.path}`;
+    line.appendChild(flag);
+  }
+  return line;
+}
+
+function renderAbout(provenance) {
+  const summary = document.getElementById("about-summary");
+  const warnings = document.getElementById("about-warnings");
+  const list = document.getElementById("about-steps");
+  if (!summary || !warnings || !list) return;
+  warnings.replaceChildren();
+  list.replaceChildren();
+  renderEnvironment(provenance);
+  const steps = provenance && Array.isArray(provenance.steps) ? provenance.steps : [];
+  if (!provenance) {
+    summary.textContent = "This map has no record of how it was made: it was built before Scientographer " +
+      "kept one (its network_data/provenance.json is missing).";
+    return;
+  }
+  summary.textContent = `Made with Scientographer ${provenance.scientographer}, built ${shortDate(provenance.built)}. ` +
+    `${steps.length} step${steps.length === 1 ? "" : "s"}, oldest first: the stage, the version that ran it, ` +
+    "its settings and the files it read, with their md5 checksums (the ones dvc.lock keeps).";
+
+  const versions = Array.isArray(provenance.versions) && provenance.versions.length
+    ? provenance.versions
+    : [...new Set(steps.map((s) => s.scientographer).filter(Boolean))];
+  if (versions.length > 1) {
+    warnings.appendChild(aboutParagraph(`Steps of this map ran on ${versions.length} versions: ${versions.join(", ")}.`));
+  }
+  const dirty = versions.filter((v) => String(v).endsWith(".dirty"));
+  if (dirty.length) {
+    warnings.appendChild(aboutParagraph(
+      `Some steps ran on a Scientographer checkout with uncommitted changes (${dirty.join(", ")}): ` +
+      "that code cannot be checked out again exactly."));
+  }
+  const unrecorded = Array.isArray(provenance.unrecorded_inputs) ? provenance.unrecorded_inputs : [];
+  if (unrecorded.length) {
+    warnings.appendChild(aboutParagraph(
+      `No record for ${unrecorded.join(", ")}: made before Scientographer kept records, so the steps ` +
+      "that made it are not listed."));
+  }
+  // build_website.py words these: different versions of Python or a key package
+  // across steps, a step run outside the project's lock, and (quietly) no lock.
+  const environmentWarnings = Array.isArray(provenance.environment_warnings) ? provenance.environment_warnings : [];
+  for (const warning of environmentWarnings) {
+    if (!warning || typeof warning.text !== "string") continue;
+    const p = aboutParagraph(warning.text);
+    if (warning.kind === "no_lock") p.className = "about-quiet";
+    warnings.appendChild(p);
+  }
+
+  steps.forEach((step, i) => {
+    const item = document.createElement("li");
+    item.className = "about-step";
+    item.id = `about-step-${i}`;
+    const head = document.createElement("div");
+    head.className = "about-step-head";
+    const number = document.createElement("span");
+    number.className = "about-number";
+    number.textContent = `${i + 1}.`;
+    const stage = document.createElement("span");
+    stage.className = "about-stage";
+    stage.textContent = step.stage || "(unnamed step)";
+    const version = document.createElement("span");
+    version.className = "about-version" + (String(step.scientographer || "").endsWith(".dirty") ? " dirty" : "");
+    version.textContent = step.scientographer ? `Scientographer ${step.scientographer}` : "version not recorded";
+    const date = document.createElement("span");
+    date.className = "about-date";
+    date.textContent = shortDate(step.date);
+    head.append(number, stage, version, date);
+    item.appendChild(head);
+    const packages = stepEnvironmentLine(step);
+    if (packages) item.appendChild(packages);
+    const inputs = (Array.isArray(step.inputs) ? step.inputs : []).filter((e) => e && e.path);
+    item.appendChild(aboutFileList("Read", inputs, steps));
+    const outputs = (Array.isArray(step.outputs) ? step.outputs : []).map((path) => ({ path }));
+    item.appendChild(aboutFileList("Wrote", outputs, steps));
+    if (step.settings && Object.keys(step.settings).length) {
+      const details = document.createElement("details");
+      const label = document.createElement("summary");
+      label.textContent = "Settings";
+      const pre = document.createElement("pre");
+      pre.textContent = JSON.stringify(step.settings, null, 2);
+      details.append(label, pre);
+      item.appendChild(details);
+    }
+    list.appendChild(item);
+  });
+}
+
+// ── About panel: opens out of the badge ──────────────────────────────────
+// The panel is as wide as its content, anchored at the bottom right, and never
+// reaches under the controls: --about-left (its furthest left edge) follows the
+// controls' right edge as they open and collapse. Opening animates its clip
+// from the badge's 44px circle to the full panel, while the logo, cropped to its
+// compass and shrunk onto the badge's compass, slides into the header and its
+// letters are revealed around the compass (the logo's O). Closing reverses it.
+const ABOUT_GAP = 12;
+const PHONE_WIDTH = 600;
+// The compass's square in the logo, as fractions of the logo (see styles.css).
+const LOGO_COMPASS = { left: 912.75 / 2398.83, top: 12.93 / 217.53, width: 177.32 / 2398.83 };
+const aboutState = { open: false, timer: null };
+
+function isPhone() {
+  return window.innerWidth <= PHONE_WIDTH;
+}
+
+function controlsExpanded() {
+  const controls = document.getElementById("controls");
+  return !!controls && !controls.classList.contains("collapsed");
+}
+
+function updateAboutLeft() {
+  const controls = document.getElementById("controls");
+  const left = isPhone() || !controls ? 16 : Math.round(controls.getBoundingClientRect().right + ABOUT_GAP);
+  document.documentElement.style.setProperty("--about-left", `${left}px`);
+}
+
+function reducedMotion() {
+  return window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+}
+
+// Where the logo starts (and ends, when closing): its compass square exactly over
+// the badge's icon, the 30px square centred in the 44px circle that shares the
+// panel's bottom-right corner. Measured on the untransformed logo.
+function placeLogoOnBadge(panel) {
+  const logo = document.getElementById("about-logo-image");
+  if (!logo) return;
+  panel.classList.remove("closed");
+  const end = logo.getBoundingClientRect();
+  const corner = panel.getBoundingClientRect();
+  const target = { left: corner.right - 37, top: corner.bottom - 37, width: 30 };
+  const square = LOGO_COMPASS.width * end.width;
+  const scale = square > 0 ? target.width / square : 1;
+  const x = target.left - end.left - scale * LOGO_COMPASS.left * end.width;
+  const y = target.top - end.top - scale * LOGO_COMPASS.top * end.height;
+  panel.style.setProperty("--logo-x", `${x}px`);
+  panel.style.setProperty("--logo-y", `${y}px`);
+  panel.style.setProperty("--logo-scale", String(scale));
+}
+
+function setAboutExpanded(open) {
+  document.getElementById("scientographer-badge")?.setAttribute("aria-expanded", String(open));
+  document.body.classList.toggle("about-open", open);
+}
+
+function openAbout() {
+  const panel = document.getElementById("about-panel");
+  if (!panel || aboutState.open) return;
+  aboutState.open = true;
+  clearTimeout(aboutState.timer);
+  // On a phone the two panels would overlap: collapse the controls first.
+  if (isPhone() && controlsExpanded()) document.getElementById("controls-toggle")?.click();
+  updateAboutLeft();
+  panel.hidden = false;
+  // Set up the badge-sized start without animating to it, then let the
+  // transitions run to the open state.
+  panel.classList.add("instant");
+  placeLogoOnBadge(panel);
+  panel.classList.add("closed");
+  void panel.offsetWidth;
+  panel.classList.remove("instant");
+  void panel.offsetWidth;
+  setAboutExpanded(true);
+  requestAnimationFrame(() => requestAnimationFrame(() => panel.classList.remove("closed")));
+  document.getElementById("about-close")?.focus({ preventScroll: true });
+}
+
+function closeAbout() {
+  const panel = document.getElementById("about-panel");
+  if (!panel || !aboutState.open) return;
+  aboutState.open = false;
+  placeLogoOnBadge(panel);
+  panel.classList.add("closed");
+  const finish = () => {
+    clearTimeout(aboutState.timer);
+    panel.removeEventListener("transitionend", onEnd);
+    if (aboutState.open) return;
+    panel.hidden = true;
+    setAboutExpanded(false);
+  };
+  const onEnd = (event) => { if (event.target === panel && event.propertyName === "clip-path") finish(); };
+  if (reducedMotion()) {
+    finish();
+    return;
+  }
+  panel.addEventListener("transitionend", onEnd);
+  aboutState.timer = setTimeout(finish, 700);
+}
+
+function toggleAbout() {
+  if (aboutState.open) closeAbout();
+  else openAbout();
+}
+
+function initAboutPanel() {
+  document.getElementById("scientographer-badge")?.addEventListener("click", openAbout);
+  document.getElementById("provenance-stamp")?.addEventListener("click", toggleAbout);
+  document.getElementById("about-close")?.addEventListener("click", closeAbout);
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && aboutState.open) closeAbout();
+  });
+  // Follow the controls as they open and collapse, and the window as it resizes.
+  const controls = document.getElementById("controls");
+  if (controls && "ResizeObserver" in window) new ResizeObserver(updateAboutLeft).observe(controls);
+  window.addEventListener("resize", updateAboutLeft);
+  // On a phone, expanding the controls closes About (they would overlap).
+  document.getElementById("controls-toggle")?.addEventListener("click", () => {
+    if (isPhone() && aboutState.open && controlsExpanded()) closeAbout();
+  });
+  updateAboutLeft();
+}
+
+
 async function main() {
   // One-time wiring (event listeners on static DOM); the renderer + per-frame
   // hooks are created lazily on the first loadDataset call.
   await loadViewsManifest();
+  const provenance = loadProvenance();
+  provenance.then(showLoadingVersion);
   initShiftTracking();
   initControls();
   initOrientationControls();
@@ -279,6 +696,16 @@ async function main() {
   document.getElementById("loading")?.classList.add("hidden");
   const badge = document.getElementById("scientographer-badge");
   if (badge) badge.hidden = false;
+  const record = await provenance;
+  showProvenanceStamp(record);
+  renderAbout(record);
+  initAboutPanel();
+  if (location.hash === "#about") openAbout();
+  if (location.hash === "#about-environment") {
+    const details = document.getElementById("about-environment-details");
+    if (details) details.open = true;
+    openAbout();
+  }
 }
 
 // Load (or switch to) a dataset: fetch its files, (re)build the graph, and
@@ -286,6 +713,7 @@ async function main() {
 async function loadDataset(name) {
   const cfg = DATASETS[name];
   state.dataset = name;
+  citationEdgeStyles.clear(); // 2D and 3D edges are styled differently
 
   // "community" has no static file (see DATASETS) -- its data is resolution-
   // indexed and populated below by setupResolutionMetrics().
@@ -335,6 +763,9 @@ async function loadDataset(name) {
   state._intraLayerBuilt = false;
   state.snapshotData = null; // belongs to the previous dataset
   state.snapshot = null; // back to the full "now" layout
+  state.bridges = null; // computed on the previous dataset's citations
+  state.topPapers = null;
+  state.detailGroup = null;
 
   document.getElementById("subtitle").innerHTML = cfg.subtitle;
 
@@ -965,6 +1396,22 @@ function initOrientationControls() {
     state.dotScale = parseFloat(dotSize.value);
     state.renderer?.refresh();
   });
+  // Edge opacity and thickness: the citation edges, in every view (3D lines are
+  // always one pixel wide, so thickness only changes the 2D views).
+  const edgeOpacity = document.getElementById("edge-opacity");
+  edgeOpacity?.addEventListener("input", () => {
+    document.getElementById("edge-opacity-value").textContent = edgeOpacity.value;
+    state.edgeOpacity = parseFloat(edgeOpacity.value);
+    citationEdgeStyles.clear();
+    state.renderer?.refresh();
+  });
+  const edgeWidth = document.getElementById("edge-width");
+  edgeWidth?.addEventListener("input", () => {
+    document.getElementById("edge-width-value").textContent = edgeWidth.value;
+    state.edgeWidth = parseFloat(edgeWidth.value);
+    citationEdgeStyles.clear();
+    state.renderer?.refresh();
+  });
   // Auto-rotate (3D views): on by default, this button stops and restarts it.
   const autoRotate = document.getElementById("auto-rotate");
   autoRotate?.addEventListener("click", () => {
@@ -1175,6 +1622,10 @@ function applyCommunityResolution(resolution) {
   }
   state.groupData.community = legend;
   state.muted.community = new Set();
+  // Bridges and top papers depend on the communities (bridgeData() also checks
+  // the resolution; the well-connected filter changes which ones are named).
+  state.bridges = null;
+  state.topPapers = null;
   computeSnapshotGroupStats();
   updateWellConnectedRow();
   refreshResolutionOptions();
@@ -1221,6 +1672,92 @@ function parseCSR(buf) {
 }
 function csrNeighbors(csr, idx) {
   return csr.targets.subarray(csr.offsets[idx], csr.offsets[idx + 1]);
+}
+
+// ── Bridge papers + top papers (rankings.js) ─────────────────────────────
+// Highlight colours on the dark map: bridges gold, top papers white, so both can
+// be on at once and still be told apart (and neither is a community colour).
+const BRIDGE_COLOR = "#ffd76e";
+const TOP_PAPER_COLOR = "#ffffff";
+// Papers per group, as the build's TOP_PAPERS.
+const TOP_PAPER_COUNT = 5;
+
+// Every paper's id in grouping `key` (its community at the current resolution,
+// or its topic), -1 for none.
+function groupIds(key) {
+  const field = groupingConfig(key).nodeField;
+  const nodes = state.nodesData.nodes;
+  const ids = new Int32Array(nodes.length);
+  for (let i = 0; i < nodes.length; i++) {
+    const gid = nodes[i][field];
+    ids[i] = gid != null && gid >= 0 ? gid : -1;
+  }
+  return ids;
+}
+
+// Participation coefficients and bridge papers at the current community
+// resolution, computed on first use. Null when the view has no communities:
+// with every paper in a community of its own, every well-linked paper would
+// look like a bridge.
+function bridgeData() {
+  const communities = citationGrouping();
+  if (!communities || state.communityResolution == null || !state.outCSR) return null;
+  if (state.bridges?.resolution !== state.communityResolution) {
+    const participation = participationCoefficients(state.outCSR, state.inCSR, groupIds(communities.key));
+    state.bridges = { resolution: state.communityResolution, ...participation, bridge: bridgePapers(participation) };
+  }
+  return state.bridges;
+}
+
+// The grouping whose top papers "Highlight top papers" marks: the one the map is
+// coloured by, else (year, citations or integration colouring) the communities.
+function topPaperGroupingKey() {
+  if (groupingConfig(state.colorBy)) return state.colorBy;
+  return (citationGrouping() || activeGroupings()[0]).key;
+}
+
+// The top papers of every named group of grouping `key` by the current ranking:
+// { byGroup: Map(group id -> paper indices, best first), scores, set (of node
+// keys) }. Cached per grouping, ranking and resolution; the cache is dropped
+// whenever the groups change (view, resolution, well-connected filter).
+function topPapersFor(key) {
+  const cacheKey = `${key}|${state.topPaperRanking}|${state.communityResolution}`;
+  state.topPapers ||= new Map();
+  if (!state.topPapers.has(cacheKey)) {
+    const nodes = state.nodesData.nodes;
+    const groupOf = groupIds(key);
+    const scores = rankingScores(state.topPaperRanking, nodes, state.inCSR, groupOf, state.nodesData.year_max);
+    const named = new Set(Object.keys(state.groupData[key] || {}).map(Number));
+    const byGroup = topPapersByGroup(scores, groupOf, named, TOP_PAPER_COUNT);
+    // As in the build's lists, a paper without a title is dropped after ranking.
+    const set = new Set();
+    for (const [gid, list] of byGroup) {
+      const titled = list.filter((i) => nodes[i].title);
+      byGroup.set(gid, titled);
+      for (const i of titled) set.add(String(i));
+    }
+    state.topPapers.set(cacheKey, { byGroup, scores, set });
+  }
+  return state.topPapers.get(cacheKey);
+}
+
+// The two "Rank top papers by" menus (control panel + group panel) show one
+// shared ranking: set it, keep both menus on it, and redraw what depends on it.
+function setTopPaperRanking(ranking) {
+  if (!RANKINGS[ranking]) return;
+  state.topPaperRanking = ranking;
+  for (const id of ["top-papers-ranking", "detail-rank-by"]) {
+    const menu = document.getElementById(id);
+    if (menu) menu.value = ranking;
+  }
+  renderTopPapersList();
+  if (state.highlightTopPapers) state.renderer.refresh();
+}
+
+function rankingOptionsHtml() {
+  return Object.entries(RANKINGS)
+    .map(([value, ranking]) => `<option value="${value}"${value === state.topPaperRanking ? " selected" : ""}>${escapeHtml(ranking.label)}</option>`)
+    .join("");
 }
 
 // ── Index build (fast filtering) ──────────────────────────────────────────
@@ -1341,6 +1878,7 @@ function initSigma() {
     labelFont: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
     minCameraRatio: 0.03,
     maxCameraRatio: 30,
+    edgeProgramClasses: { fast: EdgeFastProgram },
     nodeReducer,
     edgeReducer,
   });
@@ -1397,8 +1935,14 @@ function nodeReducer(node, attrs) {
 
   a.color = nodeColor(r);
 
-  if (state.highlightBridges && r.bridge) {
-    a.color = "#ffd76e";
+  if (state.highlightBridges && bridgeData()?.bridge[parseInt(node, 10)]) {
+    a.color = BRIDGE_COLOR;
+    a.size = a._baseSize * 1.6;
+    a.zIndex = 3;
+  }
+  // Drawn over the bridge highlight: the few papers that are both show as top papers.
+  if (state.highlightTopPapers && topPapersFor(topPaperGroupingKey()).set.has(node)) {
+    a.color = TOP_PAPER_COLOR;
     a.size = a._baseSize * 1.6;
     a.zIndex = 3;
   }
@@ -1451,10 +1995,44 @@ function edgeReducer(edge, attrs) {
   // Static citation layer is hidden unless the global toggle is on.
   if (edge.startsWith("__cite:")) {
     if (!state.showEdges) return { ...attrs, hidden: true };
+    // Coloured by the citing paper, like the PNG export's edges.
+    const source = state.nodesData.nodes[parseInt(edge.slice(7), 10)];
+    return { ...attrs, ...citationEdgeStyle(nodeColor(source)) };
   } else if (edge.startsWith("__intra:")) {
     if (!state.showIntraTopic) return { ...attrs, hidden: true };
   }
   return attrs;
+}
+
+// A citation's colour and line, from the citing paper's colour and the Edge
+// opacity and Edge thickness sliders. Cached per colour (cleared when a slider or
+// the view changes) as the reducer runs for every citation on each redraw.
+//
+// The 2D map (sigma 2.4) blends edges as premultiplied colours (gl.ONE,
+// gl.ONE_MINUS_SRC_ALPHA), so the colour is multiplied by its opacity here;
+// otherwise every edge adds its full colour and the overlaps turn white. Sigma
+// draws its edges at least 1.7 pixels wide, so thinner edges are its one-pixel
+// lines ("fast") made fainter in proportion. The 3D viewer blends ordinary
+// colours and draws one-pixel lines.
+const citationEdgeStyles = new Map();
+const SIGMA_MIN_EDGE_WIDTH = 1.7;
+function citationEdgeStyle(color) {
+  let style = citationEdgeStyles.get(color);
+  if (!style) {
+    const rgb = parseColor(color);
+    if (is3D()) {
+      style = { color: `rgba(${rgb.join(",")},${state.edgeOpacity})` };
+    } else {
+      const thin = state.edgeWidth < SIGMA_MIN_EDGE_WIDTH;
+      const alpha = state.edgeOpacity * (thin ? Math.min(1, state.edgeWidth) : 1);
+      const premultiplied = rgb.map((v) => Math.round(v * alpha));
+      style = thin
+        ? { type: "fast", color: `rgba(${premultiplied.join(",")},${alpha})` }
+        : { size: state.edgeWidth, color: `rgba(${premultiplied.join(",")},${alpha})` };
+    }
+    citationEdgeStyles.set(color, style);
+  }
+  return style;
 }
 
 // ── Color modes ───────────────────────────────────────────────────────────
@@ -1961,6 +2539,7 @@ function termList(label, value) {
 
 function showPaperDetail(idx) {
   const r = state.nodesData.nodes[idx];
+  state.detailGroup = null;
   const auths = (r.authors || "").split("|").join(", ");
   const doiHtml = r.doi
     ? `<a href="https://doi.org/${encodeURIComponent(r.doi)}" target="_blank" rel="noopener">Open DOI</a>`
@@ -1976,8 +2555,13 @@ function showPaperDetail(idx) {
         : "";
     })
     .join(" ");
-  const bridgeBadge = r.bridge
-    ? `<span class="cluster-tag" style="background:#ffd76e;color:#0e1116">Bridge paper</span>`
+  // Its participation coefficient at the current resolution (rankings.js).
+  const bridges = bridgeData();
+  const bridgeBadge = bridges?.bridge[idx]
+    ? `<span class="cluster-tag" style="background:${BRIDGE_COLOR};color:#0e1116" title="One of the ${BRIDGE_COUNT} papers whose links reach across communities the most (participation coefficient × ln(links), at least ${BRIDGE_MIN_LINKS} links)">Bridge paper</span>`
+    : "";
+  const participationHtml = bridges && bridges.links[idx]
+    ? `<div class="meta">Participation coefficient ${bridges.coefficient[idx].toFixed(2)} &middot; links reach ${bridges.communitiesReached[idx]} ${bridges.communitiesReached[idx] === 1 ? "community" : "communities"}</div>`
     : "";
 
   const numOut = state.outCSR.offsets[idx + 1] - state.outCSR.offsets[idx];
@@ -1989,6 +2573,7 @@ function showPaperDetail(idx) {
     <div class="meta">${escapeHtml(auths)}</div>
     <div class="meta">${r.year ?? ""}${r.journal ? " &middot; " + escapeHtml(r.journal) : ""}</div>
     <div class="meta">${r.indegree || 0} citations &middot; cites ${numOut} &middot; cited by ${numIn}</div>
+    ${participationHtml}
     ${termList("Keywords", r.keywords)}
     ${termList("MeSH terms", r.mesh)}
     <div class="actions">
@@ -2122,9 +2707,12 @@ function showGroupDetail(key, gid) {
     ? `<button id="show-islands">Highlight citation islands</button>`
     : "";
 
-  const papers = (c.top_papers || [])
-    .map((p) => `<li>${escapeHtml(p.title)}<div class="sub">${p.year ?? ""}${p.in_degree ? " &middot; " + p.in_degree + " citations" : ""}</div></li>`)
-    .join("");
+  // Top papers: ranked here, by the ranking the "Rank top papers by" menu picks
+  // (the build's `top_papers` are the "Citations" lists).
+  const papersBlock = `<h3 class="top-papers-head">Top papers
+      <select id="detail-rank-by" aria-label="Rank top papers by" title="Rank top papers by">${rankingOptionsHtml()}</select>
+    </h3>
+    <ul class="top-list" id="detail-top-papers"></ul>`;
   const authors = (c.top_authors || [])
     .map((a) => `<li>${escapeHtml(a.name)}<div class="sub">${a.papers ?? ""} papers</div></li>`)
     .join("");
@@ -2172,14 +2760,35 @@ function showGroupDetail(key, gid) {
     ${keywordBarsBlock}
     ${keywords ? `<h3>Top keywords</h3><ul class="top-list">${keywords}</ul>` : ""}
     ${authors ? `<h3>Top authors</h3><ul class="top-list">${authors}</ul>` : ""}
-    ${papers ? `<h3>Top papers</h3><ul class="top-list">${papers}</ul>` : ""}
+    ${papersBlock}
   `;
   document.getElementById("detail").hidden = false;
+  state.detailGroup = { key, gid };
+  renderTopPapersList();
+  document.getElementById("detail-rank-by").addEventListener("change", (e) => setTopPaperRanking(e.target.value));
   const barsEl = document.getElementById("detail-keyword-bars");
   if (barsEl && barItems) renderKeywordBars(barsEl, { items: barItems, color: c.color, maxBars: 12 });
   document.getElementById("frame-group").addEventListener("click", () => frameGroup(key, gid));
   document.getElementById("isolate-group").addEventListener("click", () => toggleIsolateGroup(key, gid));
   document.getElementById("show-islands")?.addEventListener("click", () => highlightTopicIslands(key, gid));
+}
+
+// The open group panel's top papers by the current ranking, with the value each
+// was ranked by. A no-op when no group panel is open.
+function renderTopPapersList() {
+  const list = document.getElementById("detail-top-papers");
+  if (!list || !state.detailGroup) return;
+  const { key, gid } = state.detailGroup;
+  const { byGroup, scores } = topPapersFor(key);
+  const ranking = RANKINGS[state.topPaperRanking];
+  const groupLabel = groupingConfig(key).label.toLowerCase();
+  const nodes = state.nodesData.nodes;
+  const papers = byGroup.get(Number(gid)) || [];
+  list.innerHTML = papers.length
+    ? papers
+        .map((i) => `<li>${escapeHtml(nodes[i].title)}<div class="sub">${nodes[i].year ?? ""} &middot; ${ranking.describe(scores[i], groupLabel)}</div></li>`)
+        .join("")
+    : `<li class="sub">No paper of this ${escapeHtml(groupLabel)} has a ${escapeHtml(ranking.label.toLowerCase())} value.</li>`;
 }
 
 // One-click: isolate this topic and turn on the intra-topic islands view, so its
@@ -2203,6 +2812,7 @@ function highlightTopicIslands(key, gid) {
 
 function hideDetail() {
   document.getElementById("detail").hidden = true;
+  state.detailGroup = null;
 }
 
 // ── Camera helpers ────────────────────────────────────────────────────────
@@ -2320,6 +2930,14 @@ function initControls() {
     state.highlightBridges = e.target.checked;
     state.renderer.refresh();
   });
+
+  document.getElementById("top-papers-toggle").addEventListener("change", (e) => {
+    state.highlightTopPapers = e.target.checked;
+    state.renderer.refresh();
+  });
+  const rankingMenu = document.getElementById("top-papers-ranking");
+  rankingMenu.innerHTML = rankingOptionsHtml();
+  rankingMenu.addEventListener("change", (e) => setTopPaperRanking(e.target.value));
 
   document.getElementById("edges-toggle").addEventListener("change", (e) => {
     state.showEdges = e.target.checked;

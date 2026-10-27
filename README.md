@@ -113,13 +113,15 @@ cleaned; citations among them from OpenCitations and OpenAlex. No paper is remov
 before the analysis (the previous version kept only papers with at least five
 citations within the corpus); the well-connected filter above replaces that cut. The citation
 graph, communities, metrics, keyword names and this site come from the
-Scientographer pipeline, run as a DVC project (`test-dags-scientographer` on
-DagsHub). The embedding views come from the same pipeline: every paper embedded
+Scientographer pipeline, run as a DVC project in a locked pixi environment; the
+map's **About** panel (the compass badge) lists the Scientographer version, every
+step with its settings and input checksums, and the full package list. The
+embedding views come from the same pipeline: every paper embedded
 with Gemini (`gemini-embedding-2`, 3072 dimensions; the previous version's
 vectors reused where the text is unchanged) and with SPECTER2
 (`allenai/specter2_base` with its proximity adapter, run locally); topics from
-BERTopic (UMAP to 5 dimensions, HDBSCAN with a minimum of 50 papers, c-TF-IDF
-names); positions from a separate 2-D UMAP.
+BERTopic (UMAP to 5 dimensions, HDBSCAN with a minimum of 80 papers for Gemini
+and 50 for SPECTER2, c-TF-IDF names); positions from a separate 2-D UMAP.
 
 ## Credits
 
