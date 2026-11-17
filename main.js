@@ -19,7 +19,8 @@ import { Sigma } from "https://cdn.jsdelivr.net/npm/sigma@2.4.0/+esm";
 // Sigma's one-pixel edge lines; the CommonJS module's class is on its `default`.
 import edgeFastModule from "https://cdn.jsdelivr.net/npm/sigma@2.4.0/rendering/webgl/programs/edge.fast/+esm";
 const EdgeFastProgram = edgeFastModule.default;
-import { MATCH_MODES, makeFilter } from "./textmatch.js?v=2";
+import { MATCH_MODES, makeFilter, makeQuery } from "./textmatch.js?v=4";
+import { createDensityLayer } from "./density.js?v=1";
 import {
   BRIDGE_MIN_LINKS,
   BRIDGE_COUNT,
@@ -30,6 +31,7 @@ import {
   rankingScores,
   topPapersByGroup,
 } from "./rankings.js?v=2";
+import { openColourPicker } from "./colorpicker.js?v=1";
 
 // ── Dataset definitions ─────────────────────────────────────────────────────
 // Each grouping: key (also the "Color by" value), label (detail panel + color
@@ -86,6 +88,7 @@ async function loadViewsManifest() {
       dims: v.dims === 3 ? 3 : 2,
       sharedDir: manifest.shared_dir || v.dir,
       groupings: v.groupings,
+      colorBy: v.color_by || null, // the view's own colouring, when views.json names it
     };
   }
   DATASETS = views;
@@ -204,6 +207,9 @@ const state = {
   wellConnectedMasks: {},
   wellConnectedOnly: true, // the "Papers" control
   matchMode: "word", // search + filters: word | prefix | substring | regex (textmatch.js)
+  filterAny: false, // filled text filters: false = a paper must match all, true = any
+  filtersOff: false, // the Filters switch (or F): text filters and years not applied
+  filtersPeek: false, // Space held: the same, until it is let go
 
   // floating-label bookkeeping for the currently-active grouping
   labelMode: "dynamic", // dynamic | always
@@ -676,6 +682,9 @@ async function main() {
   initWellConnectedControl();
   initTabs();
   initGlobalFilters();
+  initFiltersSwitch();
+  initEditableSliderValues();
+  initDensityLayer();
   initYearControls();
   initDatasetSelector();
   initSnapshotControl();
@@ -739,10 +748,11 @@ async function loadDataset(name) {
   state.muted = {};
   cfg.groupings.forEach((g) => { state.muted[g.key] = new Set(); });
   fileGroupings.forEach((g, i) => { state.groupData[g.key] = groupingPayloads[i]; });
-  state.colorBy = cfg.groupings[0].key;
+  state.colorBy = colorByFor(name);
 
   state.wellConnected = null;
   state.wellConnectedMasks = {};
+  fileGroupings.forEach((g) => recolourGroups(g.key)); // palettes and the viewer's colours
   try {
     const response = await fetch(`${cfg.dir}/well_connected.json`);
     state.wellConnected = response.ok ? await response.json() : null;
@@ -796,8 +806,11 @@ async function loadDataset(name) {
   }
 
   hideDetail();
+  // Keep the applied filters across a view switch (the boxes still show them).
+  if (Object.values(state.filters).some((q) => (q || "").trim())) await applyGlobalFilters();
   updateSelectedCount();
   state.renderer.refresh();
+  state.density?.update();
 }
 
 function initDatasetSelector() {
@@ -1039,6 +1052,20 @@ function parseColor(color) {
   }
   const rgb = /rgba?\(([^)]+)\)/i.exec(color || "");
   return rgb ? rgb[1].split(",").slice(0, 3).map((v) => parseFloat(v)) : [136, 136, 136];
+}
+
+// A colour faded two thirds of the way into the page background (opaque, so it
+// draws the same in 2D and 3D), for papers shown only as context.
+const FADED_COLORS = new Map();
+function fadedColor(color) {
+  let faded = FADED_COLORS.get(color);
+  if (!faded) {
+    const bg = parseColor(getComputedStyle(document.body).backgroundColor || "#0e1116");
+    const rgb = parseColor(color).map((v, i) => Math.round(v * 0.33 + bg[i] * 0.67));
+    faded = `rgb(${rgb.join(",")})`;
+    FADED_COLORS.set(color, faded);
+  }
+  return faded;
 }
 
 // The colour, darkened until it reads on white (greys stay grey).
@@ -1513,6 +1540,7 @@ async function setupResolutionMetrics(cfg) {
   // default resolution). applyCommunityResolution() handles later switches.
   state.communityResolution = defaultRes;
   state.groupData.community = communityLegend(defaultRes);
+  recolourGroups("community"); // the papers come with the site's colours at this resolution
   updateWellConnectedRow();
   refreshResolutionOptions();
   // Switching views keeps the resolution the user picked, when this view has it.
@@ -1621,6 +1649,7 @@ function applyCommunityResolution(resolution) {
     r.community_color = entry ? entry.color : OUTLIER_COLOR_JS;
   }
   state.groupData.community = legend;
+  recolourGroups("community");
   state.muted.community = new Set();
   // Bridges and top papers depend on the communities (bridgeData() also checks
   // the resolution; the well-connected filter changes which ones are named).
@@ -1852,6 +1881,7 @@ async function useRenderer(threeD) {
     if (!state.sigma) {
       initSigma();
       attachRenderer(state.sigma, sigmaContainer);
+      state.density?.attach(state.sigma);
     }
     if (state.renderer3d) state.renderer3d.setVisible(false);
     sigmaContainer.hidden = false;
@@ -1861,6 +1891,7 @@ async function useRenderer(threeD) {
   // Controls only one kind of view has.
   for (const el of document.querySelectorAll("[data-view-3d]")) el.hidden = !threeD;
   for (const el of document.querySelectorAll("[data-view-2d]")) el.hidden = threeD;
+  state.density?.update();
 }
 
 // ── Sigma setup ───────────────────────────────────────────────────────────
@@ -1915,11 +1946,14 @@ function nodeReducer(node, attrs) {
     a.hidden = true;
     return a;
   }
-  if (state.filteredSet && !state.filteredSet.has(node)) {
-    a.hidden = true;
-    return a;
-  }
-  if (r.year != null && (r.year < state.yearMin || r.year > state.yearMax)) {
+  // The text filters and the year range, unless the Filters switch (F, Space)
+  // has them off. The papers they leave out are hidden, or drawn faded under the
+  // density layer's "Show all papers under the heat".
+  const filtering = filtersActive();
+  let leftOut = false;
+  if (filtering && state.filteredSet && !state.filteredSet.has(node)) leftOut = true;
+  if (filtering && r.year != null && (r.year < state.yearMin || r.year > state.yearMax)) leftOut = true;
+  if (leftOut && !state.density?.showsAll()) {
     a.hidden = true;
     return a;
   }
@@ -1934,6 +1968,13 @@ function nodeReducer(node, attrs) {
   }
 
   a.color = nodeColor(r);
+  if (leftOut) {
+    a.color = fadedColor(a.color);
+    a.size = a._baseSize * 0.7;
+    a.zIndex = 0;
+    a.label = "";
+    return a;
+  }
 
   if (state.highlightBridges && bridgeData()?.bridge[parseInt(node, 10)]) {
     a.color = BRIDGE_COLOR;
@@ -2263,6 +2304,7 @@ function positionTooltipAt(e) {
 
 function initHover(renderer, container) {
   renderer.on("enterNode", ({ node }) => {
+    state.colourSampler?.hover(displayedColour(node));
     state.hoveredNode = node;
     const r = state.graph.getNodeAttribute(node, "_data");
     const auths = (r.authors || "").split("|");
@@ -2276,6 +2318,7 @@ function initHover(renderer, container) {
   });
 
   renderer.on("leaveNode", () => {
+    state.colourSampler?.leave();
     state.hoveredNode = null;
     hideTooltipEl();
     state.renderer.refresh();
@@ -2286,8 +2329,12 @@ function initHover(renderer, container) {
 
 // ── Selection (click → draw incident edges + open detail) ────────────────
 function initSelection(renderer) {
-  renderer.on("clickNode", ({ node }) => selectNode(parseInt(node, 10)));
+  renderer.on("clickNode", ({ node }) => {
+    if (state.colourSampler) return state.colourSampler.take(displayedColour(node)); // the colour picker's eyedropper
+    selectNode(parseInt(node, 10));
+  });
   renderer.on("clickStage", () => {
+    if (state.colourSampler) return;
     clearSelection();
     hideDetail();
   });
@@ -2917,6 +2964,7 @@ function isolateGroup(key, gid) {
 function initControls() {
   document.getElementById("color-by").addEventListener("change", (e) => {
     state.colorBy = e.target.value;
+    state.colorByChoice = e.target.value; // the viewer's own pick: kept across views
     renderGroupLabels();
     state.renderer.refresh();
   });
@@ -2965,6 +3013,23 @@ function initControls() {
 
 // Build the "Color by" menu from the active dataset's groupings (+ year /
 // citations), then point colorBy at the current value.
+// What a view is coloured by when it opens: what the viewer picked in "Color
+// by" (state.colorByChoice), if this view offers it; otherwise the view's own
+// grouping: views.json's color_by, else the topics of an embedding map (a view
+// other than the main citation map that has its own semantic grouping), else
+// its first grouping (communities on the citation layouts).
+function colorByFor(name) {
+  const cfg = DATASETS[name];
+  const keys = cfg.groupings.map((g) => g.key);
+  const offered = new Set([...keys, "year", "indegree"]);
+  if (cfg.groupings.some((g) => g.citation)) offered.add("integration");
+  if (state.colorByChoice && offered.has(state.colorByChoice)) return state.colorByChoice;
+  if (cfg.colorBy && offered.has(cfg.colorBy)) return cfg.colorBy;
+  const semantic = cfg.groupings.find((g) => g.semantic);
+  if (semantic && cfg.dir !== cfg.sharedDir) return semantic.key;
+  return keys[0];
+}
+
 function buildColorByOptions() {
   const sel = document.getElementById("color-by");
   const opts = activeGroupings().map((g) => ({ value: g.key, label: g.label }));
@@ -2977,6 +3042,168 @@ function buildColorByOptions() {
 }
 
 // Generate one <details> legend block per grouping into #legends.
+// ── Group colours: palettes and the user's own colours ─────────────────────
+// Every grouping (communities, topics) can take another palette, and any group
+// a colour of the viewer's choosing. Both are kept in this browser
+// (localStorage, per site) and applied by rewriting the colours the rest of
+// the page reads: each group's entry (legend, labels, panels, export labels)
+// and each paper's copy (dots, citation edges, exports). The site's own
+// colours are kept aside (_siteColor) to go back to.
+//
+// A chosen colour is stored with the group's name and only applies while the
+// group of that id still has that name: a rebuilt map whose communities came
+// out differently never paints a saved colour onto the wrong group.
+const GROUP_PALETTES = [
+  { key: "original", label: "Original" },
+  // Kenneth Kelly (1965): 22 colours of maximum contrast (white and black left out).
+  { key: "kelly", label: "Kelly (maximum contrast)", colors: ["#F3C300", "#875692", "#F38400", "#A1CAF1", "#BE0032", "#C2B280", "#848482", "#008856", "#E68FAC", "#0067A5", "#F99379", "#604E97", "#F6A600", "#B3446C", "#DCD300", "#882D17", "#8DB600", "#654522", "#E25822", "#2B3D26"] },
+  // Tableau 20 (Tableau Software).
+  { key: "tableau20", label: "Tableau 20", colors: ["#4E79A7", "#A0CBE8", "#F28E2B", "#FFBE7D", "#59A14F", "#8CD17D", "#B6992D", "#F1CE63", "#499894", "#86BCB6", "#E15759", "#FF9D9A", "#79706E", "#BAB0AC", "#D37295", "#FABFD2", "#B07AA1", "#D4A6C8", "#9D7660", "#D7B5A6"] },
+  // CARTOColors (CARTO), qualitative; their closing grey left out.
+  { key: "bold", label: "Bold (CARTO)", colors: ["#7F3C8D", "#11A579", "#3969AC", "#F2B701", "#E73F74", "#80BA5A", "#E68310", "#008695", "#CF1C90", "#F97B72", "#4B4B8F"] },
+  { key: "vivid", label: "Vivid (CARTO)", colors: ["#E58606", "#5D69B1", "#52BCA3", "#99C945", "#CC61B0", "#24796C", "#DAA51B", "#2F8AC4", "#764E9F", "#ED645A", "#CC3A8E"] },
+  { key: "prism", label: "Prism (CARTO)", colors: ["#5F4690", "#1D6996", "#38A6A5", "#0F8554", "#73AF48", "#EDAD08", "#E17C05", "#CC503E", "#94346E", "#6F4070", "#994E95"] },
+  { key: "safe", label: "Safe for colour blindness (CARTO)", colors: ["#88CCEE", "#CC6677", "#DDCC77", "#117733", "#332288", "#AA4499", "#44AA99", "#999933", "#882255", "#661100", "#6699CC"] },
+  { key: "pastel", label: "Pastel (CARTO)", colors: ["#66C5CC", "#F6CF71", "#F89C74", "#DCB0F2", "#87C55F", "#9EB9F3", "#FE88B1", "#C9DB74", "#8BE0A4", "#B497E7", "#D3B484"] },
+  { key: "antique", label: "Antique (CARTO)", colors: ["#855C75", "#D9AF6B", "#AF6458", "#736F4C", "#526A83", "#625377", "#68855C", "#9C9C5E", "#A06177", "#8C785D", "#467378"] },
+  // ColorBrewer (Cynthia Brewer), qualitative.
+  { key: "set3", label: "Set3 (ColorBrewer)", colors: ["#8DD3C7", "#FFFFB3", "#BEBADA", "#FB8072", "#80B1D3", "#FDB462", "#B3DE69", "#FCCDE5", "#D9D9D9", "#BC80BD", "#CCEBC5", "#FFED6F"] },
+  { key: "paired", label: "Paired (ColorBrewer)", colors: ["#A6CEE3", "#1F78B4", "#B2DF8A", "#33A02C", "#FB9A99", "#E31A1C", "#FDBF6F", "#FF7F00", "#CAB2D6", "#6A3D9A", "#FFFF99", "#B15928"] },
+  // Okabe & Ito (2008), safe for colour blindness; black and grey left out.
+  { key: "okabeito", label: "Okabe–Ito (colour-blind safe)", colors: ["#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7"] },
+];
+const COLOURS_KEY = `scientographer-colours:${location.pathname}`;
+
+function loadColourSettings() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(COLOURS_KEY) || "null");
+    if (saved && saved.version === 1) return saved;
+  } catch {
+    // storage blocked or unreadable: start from the site's colours
+  }
+  return { version: 1, palettes: {}, colors: {} };
+}
+const colourSettings = loadColourSettings();
+function saveColourSettings() {
+  try {
+    localStorage.setItem(COLOURS_KEY, JSON.stringify(colourSettings));
+  } catch {
+    // not saved (private window, storage full): the colours still apply now
+  }
+}
+
+// The key of a group's chosen colour: communities differ per resolution.
+function groupColourKey(key, gid) {
+  return `${key}|${key === "community" ? state.communityResolution : ""}|${gid}`;
+}
+
+// The colour a group is drawn in: the viewer's own, else the grouping's
+// palette, else the site's.
+function groupColour(key, gid, entry) {
+  const own = colourSettings.colors[groupColourKey(key, gid)];
+  if (own && own.name === entry.name) return own.color;
+  const palette = GROUP_PALETTES.find((p) => p.key === colourSettings.palettes[key]);
+  const n = parseInt(gid, 10);
+  if (palette?.colors && n >= 0) return palette.colors[n % palette.colors.length];
+  return entry._siteColor;
+}
+
+// Rewrite one grouping's colours (its entries and its papers' copies).
+function recolourGroups(key) {
+  const g = grouping(key);
+  if (!g?.data) return;
+  for (const [gid, entry] of Object.entries(g.data)) {
+    if (entry._siteColor == null) entry._siteColor = entry.color;
+    entry.color = groupColour(key, gid, entry);
+  }
+  for (const r of state.nodesData.nodes) {
+    const entry = g.data[String(r[g.nodeField])];
+    if (entry) r[g.colorField] = entry.color;
+  }
+}
+
+// After a colour change: everything that shows a group's colour.
+function groupColoursChanged(key) {
+  recolourGroups(key);
+  citationEdgeStyles.clear();
+  buildLegend(key);
+  renderGroupLabels();
+  state.renderer?.refresh();
+}
+
+// While the picker is open: the colour on the map, nothing saved yet.
+function previewGroupColour(key, gid, color, swatch) {
+  const g = grouping(key);
+  const entry = g.data[gid];
+  if (!entry || entry.color === color) return;
+  entry.color = color;
+  for (const r of state.nodesData.nodes) if (String(r[g.nodeField]) === String(gid)) r[g.colorField] = color;
+  if (swatch) swatch.style.background = color;
+  citationEdgeStyles.clear();
+  renderGroupLabels();
+  state.renderer?.refresh();
+}
+
+// The picker's quick colours: the grouping's palette, or the site's colours.
+function quickColours(key) {
+  const palette = GROUP_PALETTES.find((p) => p.key === colourSettings.palettes[key]);
+  if (palette?.colors) return palette.colors;
+  const g = grouping(key);
+  const ids = Object.keys(g.data).map(Number).filter((n) => n >= 0).sort((a, b) => a - b);
+  return [...new Set(ids.map((n) => g.data[n]._siteColor || g.data[n].color))].slice(0, 20);
+}
+
+// The picker's eyedropper on the map: hovering a dot previews its colour and a
+// click takes it, instead of the usual tooltip refresh and selection.
+const mapColourSampler = {
+  start(handlers) { state.colourSampler = handlers; },
+  stop() { state.colourSampler = null; },
+};
+function displayedColour(node) {
+  return nodeReducer(node, state.graph.getNodeAttributes(node)).color;
+}
+
+function setGroupColour(key, gid, color) {
+  const entry = grouping(key).data[gid];
+  colourSettings.colors[groupColourKey(key, gid)] = { color, name: entry.name };
+  saveColourSettings();
+  groupColoursChanged(key);
+}
+
+function setGroupPalette(key, palette) {
+  if (palette === "original") delete colourSettings.palettes[key];
+  else colourSettings.palettes[key] = palette;
+  saveColourSettings();
+  groupColoursChanged(key);
+}
+
+// Back to the site's colours for a grouping: its palette and every chosen
+// colour (at every resolution).
+function resetGroupColours(key) {
+  delete colourSettings.palettes[key];
+  for (const k of Object.keys(colourSettings.colors)) if (k.startsWith(`${key}|`)) delete colourSettings.colors[k];
+  saveColourSettings();
+  groupColoursChanged(key);
+}
+
+// Colour controls above a legend: the palette and a reset.
+function legendColourRow(key) {
+  const row = document.createElement("div");
+  row.className = "legend-colour-row";
+  const own = Object.keys(colourSettings.colors).some((k) => k.startsWith(`${key}|`));
+  row.innerHTML = `
+    <label>Palette
+      <select>${GROUP_PALETTES.map((p) => `<option value="${p.key}">${escapeHtml(p.label)}</option>`).join("")}</select>
+    </label>
+    <button type="button" title="Back to the site's colours: the original palette and no colours of your own"${own || colourSettings.palettes[key] ? "" : " disabled"}>Reset colours</button>
+    <span class="legend-colour-hint">Click a colour to change it; kept in this browser.</span>`;
+  const select = row.querySelector("select");
+  select.value = colourSettings.palettes[key] || "original";
+  select.addEventListener("change", () => setGroupPalette(key, select.value));
+  row.querySelector("button").addEventListener("click", () => resetGroupColours(key));
+  return row;
+}
+
 function buildLegends() {
   const container = document.getElementById("legends");
   container.innerHTML = "";
@@ -3014,7 +3241,8 @@ function initSearch() {
       list.innerHTML = "";
       return;
     }
-    // Titles and authors in the chosen matching mode; DOIs anywhere.
+    // Titles and authors together in the chosen matching mode (so a query can
+    // name an author and a title word); DOIs anywhere.
     let test;
     try {
       test = makeFilter(q, state.matchMode);
@@ -3027,7 +3255,7 @@ function initSearch() {
     const nodes = state.nodesData.nodes;
     const idx = state.index;
     for (let i = 0; i < nodes.length && hits.length < 25; i++) {
-      if (test(idx.title[i]) || test(idx.authors[i]) || idx.doi[i].includes(doi)) hits.push(i);
+      if (test(`${idx.title[i]}\n|\n${idx.authors[i]}`) || idx.doi[i].includes(doi)) hits.push(i);
     }
     list.innerHTML = hits
       .map((i) => {
@@ -3099,6 +3327,9 @@ function buildLegend(key) {
   // switch), so drop any button row from a previous call before adding a new one.
   const prevBtnRow = ul.previousElementSibling;
   if (prevBtnRow && prevBtnRow.classList.contains("legend-btn-row")) prevBtnRow.remove();
+  const prevColourRow = ul.previousElementSibling;
+  if (prevColourRow && prevColourRow.classList.contains("legend-colour-row")) prevColourRow.remove();
+  ul.parentNode.insertBefore(legendColourRow(key), ul);
 
   const btnRow = document.createElement("div");
   btnRow.className = "legend-btn-row";
@@ -3136,8 +3367,22 @@ function buildLegend(key) {
     const c = g.data[cid];
     const li = document.createElement("li");
     li.dataset.cid = cid;
-    li.innerHTML = `<span class="swatch" style="background:${c.color}"></span>${escapeHtml(c.name)} <span style="margin-left:auto;color:var(--text-dim)">${c.size}</span>`;
+    li.innerHTML = `<button type="button" class="swatch swatch-pick" style="background:${c.color}" title="Change the colour of ${escapeHtml(c.name)}" aria-label="Change the colour of ${escapeHtml(c.name)}"></button>${escapeHtml(c.name)} <span style="margin-left:auto;color:var(--text-dim)">${c.size}</span>`;
     li.style.display = "flex";
+    const swatch = li.querySelector(".swatch-pick");
+    swatch.addEventListener("click", (e) => {
+      e.stopPropagation(); // pick a colour, don't toggle the group
+      openColourPicker({
+        anchor: swatch,
+        color: c.color,
+        title: c.name,
+        quick: quickColours(key),
+        onInput: (color) => previewGroupColour(key, cid, color, swatch),
+        onDone: (color) => setGroupColour(key, cid, color),
+        onCancel: () => groupColoursChanged(key),
+        sampler: mapColourSampler,
+      });
+    });
     li.addEventListener("click", () => toggleRow(parseInt(cid, 10)));
     li.addEventListener("dblclick", () => {
       g.muted.clear();
@@ -3247,17 +3492,57 @@ function initGlobalFilters() {
 
   btn.addEventListener("click", run);
 
+  const any = document.getElementById("filter-any");
+  if (any) {
+    any.checked = state.filterAny;
+    any.addEventListener("change", () => {
+      state.filterAny = any.checked;
+      if (state.filteredSet) run();
+    });
+  }
+
   const mode = document.getElementById("match-mode");
   if (mode) {
     mode.innerHTML = MATCH_MODES.map((m) => `<option value="${m.value}">${escapeHtml(m.label)}</option>`).join("");
     mode.value = state.matchMode;
     mode.addEventListener("change", () => {
       state.matchMode = mode.value;
+      inputs.forEach(showQuery);
       if (state.filteredSet) run();
     });
   }
 
   const inputs = [elTitle, elAuthor, elAbstract, elJournal, elKeywords, elMesh].filter(Boolean);
+
+  // Under each filter, the query as it will be searched in the current matching
+  // mode (plurals, operators, brackets), or what is wrong with it.
+  const showQuery = (input) => {
+    const line = input._queryLine;
+    let query = null, error = null;
+    try {
+      query = makeQuery(input.value, state.matchMode);
+    } catch (err) {
+      error = err.message;
+    }
+    line.hidden = input.hidden || (!query && !error);
+    line.classList.toggle("query-error", !!error);
+    line.innerHTML = error
+      ? `Invalid query: ${escapeHtml(error)}`
+      : query ? `searching <code>${escapeHtml(query.text)}</code>` : "";
+  };
+  for (const input of inputs) {
+    const line = document.createElement("div");
+    line.className = "query-line";
+    line.hidden = true;
+    input.after(line);
+    input._queryLine = line;
+    let timer = null;
+    input.addEventListener("input", () => {
+      clearTimeout(timer);
+      timer = setTimeout(() => showQuery(input), 150);
+    });
+  }
+
   for (const input of inputs) {
     input.addEventListener("keydown", (e) => {
       if (e.key !== "Enter") return;
@@ -3272,72 +3557,291 @@ async function ensureAbstractsLoadedIfNeeded() {
   if (state.filters.abstract.trim() && !state.abstracts) await loadAbstract("n2");
 }
 
+// The fields the filters search, and the text of one for paper i.
+const FILTER_FIELDS = ["title", "author", "abstract", "keywords", "mesh", "journal"];
+function fieldText(field, i) {
+  const idx = state.index;
+  switch (field) {
+    case "title": return idx.title[i];
+    case "author": return idx.authors[i];
+    case "abstract": return state.abstracts?.[state.nodesData.nodes[i].id] || "";
+    case "keywords": return idx.keywords[i];
+    case "mesh": return idx.mesh[i];
+    default: return idx.journal[i];
+  }
+}
+
 async function applyGlobalFilters() {
   await ensureAbstractsLoadedIfNeeded();
 
   const f = state.filters;
-  // Every field: comma-separated queries that must all match, in the chosen
-  // matching mode (whole words by default, so "dance" skips "guidance").
+  // Every field: a query (AND / OR / NOT, brackets, "quoted phrases"; see
+  // textmatch.js) in the chosen matching mode (whole words by default, so
+  // "dance" skips "guidance").
   let tests;
   try {
-    tests = Object.fromEntries(["title", "journal", "abstract", "author", "keywords", "mesh"]
-      .map((k) => [k, makeFilter(f[k] || "", state.matchMode)]));
+    tests = Object.fromEntries(FILTER_FIELDS.map((k) => [k, makeFilter(f[k] || "", state.matchMode)]));
   } catch (err) {
     const el = document.getElementById("selected-count");
-    if (el) el.textContent = `Invalid regular expression: ${err.message}`;
+    if (el) el.textContent = `Invalid query: ${err.message}`;
     return;
   }
 
   const lo = state.yearMin;
   const hi = state.yearMax;
-  const idx = state.index;
   const nodes = state.nodesData.nodes;
   const out = new Set();
+  // A paper must match all the filled text filters, or any of them with the
+  // "Any filter" switch; years, well-connected papers, muted groups and the time
+  // snapshot always apply.
+  const filled = Object.entries(tests).filter(([, test]) => test);
 
   for (let i = 0; i < nodes.length; i++) {
     const r = nodes[i];
     if (state.snapshot && !state.snapshot.visible.has(String(i))) continue;
     if (r.year != null && (r.year < lo || r.year > hi)) continue;
     if (nodeHiddenByMute(r) || removedByModifier(i)) continue;
-    if (tests.title && !tests.title(idx.title[i])) continue;
-    if (tests.journal && !tests.journal(idx.journal[i])) continue;
-    if (tests.author && !tests.author(idx.authors[i])) continue;
-    if (tests.keywords && !tests.keywords(idx.keywords[i])) continue;
-    if (tests.mesh && !tests.mesh(idx.mesh[i])) continue;
-    if (tests.abstract && !tests.abstract(state.abstracts?.[r.id] || "")) continue;
+    if (filled.length) {
+      const matches = ([field, test]) => test(fieldText(field, i));
+      if (state.filterAny ? !filled.some(matches) : !filled.every(matches)) continue;
+    }
     out.add(String(i));
   }
 
   state.filteredSet = out;
   updateSelectedCount();
   state.renderer.refresh();
+  state.density?.update();
 }
 
 function scheduleRefilter() {
   clearTimeout(state._refilterTimer);
   state._refilterTimer = setTimeout(() => {
     if (state.filteredSet) applyGlobalFilters();
-    else updateSelectedCount();
+    else {
+      updateSelectedCount();
+      state.density?.update();
+    }
   }, 90);
+}
+
+// ── Density layer (density.js) ─────────────────────────────────────────────
+// The papers the filters select, in layout coordinates (the time snapshot's
+// when one is active), or null while no filter narrows the selection: no text
+// filter applied and the full year range.
+function densityPoints(weight = "presence") {
+  const nodes = state.nodesData?.nodes;
+  if (!nodes) return null;
+  const textFilter = state.filteredSet && Object.values(state.filters).some((q) => (q || "").trim());
+  const yearsNarrowed = state.yearMin > state.nodesData.year_min || state.yearMax < state.nodesData.year_max;
+  if (!textFilter && !yearsNarrowed) return null;
+  // Weights other than presence count the searched words in the fields that
+  // have a text filter.
+  let queries = null;
+  if (textFilter && weight !== "presence") {
+    try {
+      queries = FILTER_FIELDS
+        .map((k) => [k, makeQuery(state.filters[k] || "", state.matchMode)])
+        .filter(([, q]) => q);
+    } catch {
+      queries = null;
+    }
+  }
+  const xs = [], ys = [], indices = [], weights = queries ? [] : null;
+  for (let i = 0; i < nodes.length; i++) {
+    const r = nodes[i];
+    if (state.filteredSet) {
+      if (!state.filteredSet.has(String(i))) continue;
+    } else {
+      if (state.snapshot && !state.snapshot.visible.has(String(i))) continue;
+      if (r.year != null && (r.year < state.yearMin || r.year > state.yearMax)) continue;
+      if (nodeHiddenByMute(r) || removedByModifier(i)) continue;
+    }
+    const c = state.snapshot ? state.snapshot.coords[r.id] : [r.x, r.y];
+    if (!c) continue;
+    xs.push(+c[0]);
+    ys.push(+c[1]);
+    indices.push(i);
+    if (queries) {
+      let mentions = 0, words = 0;
+      for (const [k, q] of queries) {
+        const text = fieldText(k, i) || "";
+        mentions += q.count(text);
+        if (weight === "per1000") words += text.split(/\s+/).filter(Boolean).length;
+      }
+      weights.push(weight === "count" ? mentions
+        : weight === "log" ? Math.log1p(mentions)
+        : (1000 * mentions) / Math.max(1, words));
+    }
+  }
+  return { xs, ys, indices, weights, weighted: !!queries };
+}
+
+function initDensityLayer() {
+  if (!document.getElementById("density-on")) return;
+  state.density = createDensityLayer({
+    container: document.getElementById("sigma-container"),
+    renderer: () => (is3D() ? null : state.sigma),
+    is3D,
+    points: densityPoints,
+    basePositions: () => ({
+      xs: state.nodesData.nodes.map((r) => +r.x),
+      ys: state.nodesData.nodes.map((r) => +r.y),
+    }),
+    toGraph: orient,
+    viewKey: () => state.dataset,
+    filtersActive,
+    refresh: () => state.renderer?.refresh(),
+  });
 }
 
 function updateSelectedCount() {
   const el = document.getElementById("selected-count");
   if (!el) return;
-  if (!state.filteredSet) {
+  const filtering = filtersActive();
+  if (!state.filteredSet || !filtering) {
     let c = 0;
     const nodes = state.nodesData.nodes;
     for (let i = 0; i < nodes.length; i++) {
       const r = nodes[i];
       if (state.snapshot && !state.snapshot.visible.has(String(i))) continue;
-      if (r.year != null && (r.year < state.yearMin || r.year > state.yearMax)) continue;
+      if (filtering && r.year != null && (r.year < state.yearMin || r.year > state.yearMax)) continue;
       if (nodeHiddenByMute(r) || removedByModifier(i)) continue;
       c++;
     }
-    el.textContent = `Nodes selected: ${c.toLocaleString()}`;
+    el.textContent = `Nodes selected: ${c.toLocaleString()}${filtering ? "" : " (filters off)"}`;
     return;
   }
   el.textContent = `Nodes selected: ${state.filteredSet.size.toLocaleString()}`;
+}
+
+// ── Typed slider values ───────────────────────────────────────────────────
+// Every slider's readout (the <span> in its <label for=…>) can be clicked and
+// typed into. The typed number times the slider's data-scale is its value (a
+// readout in % of a 0-1 slider has data-scale 0.01). Out-of-range values are
+// clamped; values between the slider's steps are kept exactly (the slider takes
+// any value from then on), except on the year sliders, which take whole years.
+// The year readout ("1990–2010") takes both ends.
+function initEditableSliderValues() {
+  for (const label of document.querySelectorAll("label[for]")) {
+    const slider = document.getElementById(label.htmlFor);
+    const readout = label.querySelector("span[id]");
+    if (!slider || slider.type !== "range" || !readout) continue;
+    const pair = slider.id === "year-min" ? [slider, document.getElementById("year-max")] : [slider];
+    readout.classList.add("editable-value");
+    readout.title = "Click to type a value";
+    readout.tabIndex = 0;
+    const edit = (e) => {
+      e.preventDefault(); // a click on a label would otherwise focus the slider
+      e.stopPropagation();
+      if (readout.querySelector("input")) return;
+      const before = readout.textContent;
+      const box = document.createElement("input");
+      box.type = "text";
+      box.className = "editable-value-input";
+      box.value = before.replace(/[×%]/g, "").trim();
+      box.size = Math.max(4, box.value.length + 1);
+      readout.textContent = "";
+      readout.appendChild(box);
+      box.focus();
+      box.select();
+      let done = false;
+      const finish = (apply) => {
+        if (done) return;
+        done = true;
+        const text = box.value;
+        readout.textContent = before; // the slider's own handler rewrites it
+        if (apply) setSliders(pair, text);
+      };
+      box.addEventListener("keydown", (k) => {
+        if (k.key === "Enter") finish(true);
+        if (k.key === "Escape") finish(false);
+        k.stopPropagation();
+      });
+      box.addEventListener("blur", () => finish(true));
+      box.addEventListener("click", (c) => { c.preventDefault(); c.stopPropagation(); });
+    };
+    readout.addEventListener("click", edit);
+    readout.addEventListener("keydown", (k) => { if (k.key === "Enter") edit(k); });
+  }
+}
+
+function setSliders(sliders, text) {
+  // No slider goes below zero, so "1990-2010" is two years, not a minus sign.
+  const numbers = (text.match(/\d+(?:[.,]\d+)?|[.,]\d+/g) || []).map((n) => parseFloat(n.replace(",", ".")));
+  if (numbers.length < sliders.length) return;
+  sliders.forEach((slider, i) => {
+    const min = parseFloat(slider.min), max = parseFloat(slider.max);
+    let value = numbers[i] * parseFloat(slider.dataset.scale || "1");
+    value = Math.min(max, Math.max(min, value));
+    if (slider.id === "year-min" || slider.id === "year-max") value = Math.round(value);
+    else {
+      const step = parseFloat(slider.step) || 1;
+      const steps = (value - (Number.isFinite(min) ? min : 0)) / step;
+      if (Math.abs(steps - Math.round(steps)) > 1e-9) slider.step = "any";
+    }
+    slider.value = String(value);
+    slider.dispatchEvent(new Event("input", { bubbles: true }));
+    slider.dispatchEvent(new Event("change", { bubbles: true }));
+  });
+}
+
+// ── Filters on / off ───────────────────────────────────────────────────────
+// The Filters switch turns the text filters and the year range off (every
+// paper back, the boxes keeping their text) and on again; F does the same, and
+// holding Space shows the map unfiltered until it is let go. Well-connected
+// papers, muted groups and the time snapshot are the view, not filters: they
+// stay. Keys typed into a text box, a menu or the like are left alone.
+function filtersActive() {
+  return !state.filtersOff && !state.filtersPeek;
+}
+
+function filtersChanged() {
+  const box = document.getElementById("filters-on");
+  if (box) box.checked = !state.filtersOff;
+  const badge = document.getElementById("filters-off-badge");
+  if (badge) {
+    badge.hidden = filtersActive();
+    badge.innerHTML = state.filtersPeek
+      ? "Unfiltered map while <kbd>Space</kbd> is held"
+      : "Filters off: every paper shown · <kbd>F</kbd> turns them back on";
+  }
+  updateSelectedCount();
+  state.renderer?.refresh();
+}
+
+function typingInto(target) {
+  if (!(target instanceof HTMLElement)) return false;
+  if (target.isContentEditable || target.tagName === "TEXTAREA" || target.tagName === "SELECT") return true;
+  return target.tagName === "INPUT" && !["checkbox", "radio", "range", "button", "submit", "reset"].includes(target.type);
+}
+
+function initFiltersSwitch() {
+  const box = document.getElementById("filters-on");
+  box?.addEventListener("change", () => {
+    state.filtersOff = !box.checked;
+    filtersChanged();
+  });
+  window.addEventListener("keydown", (e) => {
+    if (e.ctrlKey || e.metaKey || e.altKey || typingInto(e.target)) return;
+    if (e.code === "Space") {
+      e.preventDefault(); // no page scroll, no click on a focused button
+      if (!e.repeat && !state.filtersPeek) {
+        state.filtersPeek = true;
+        filtersChanged();
+      }
+    } else if ((e.key === "f" || e.key === "F") && !e.repeat) {
+      state.filtersOff = !state.filtersOff;
+      filtersChanged();
+    }
+  });
+  const release = () => {
+    if (!state.filtersPeek) return;
+    state.filtersPeek = false;
+    filtersChanged();
+  };
+  window.addEventListener("keyup", (e) => { if (e.code === "Space") release(); });
+  window.addEventListener("blur", release); // the key may be let go in another window
 }
 
 // ── Shift key tracking ─────────────────────────────────────────────────────
